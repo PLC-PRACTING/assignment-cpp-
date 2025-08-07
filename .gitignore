@@ -1,14 +1,25 @@
-# 忽略构建目录
-build/
+# 忽略所有构建目录
+/build
+/obj
 
-# 忽略 Make 的对象文件目录
-obj/
-
-# 忽略可执行文件
+# 忽略所有编译生成的可执行文件和库文件
 *.exe
+*.dll
+*.lib
+*.o
+*.obj
+*.a
+*.so
 
-# 忽略汇编输出文件
+# 忽略编译器生成的汇编代码
 *.s
+*.asm
 
-# 忽略 VS Code 的配置文件
+# 忽略日志文件和VS Code等编辑器的配置
+*.log
 .vscode/
+.idea/
+
+# 忽略操作系统自动生成的文件
+.DS_Store
+Thumbs.db
