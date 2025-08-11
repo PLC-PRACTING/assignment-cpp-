@@ -1475,13 +1475,26 @@ void CodeGenerator::generateBinaryExpression(BinaryExpression *expr)
         }
         else
         {
-            // 使用标准栈方法，确保正确性
-            generateExpression(expr->right.get());
-            emit("addi sp, sp, -4");
-            emit("sw a0, 0(sp)");
-            generateExpression(expr->left.get());
-            emit("lw a1, 0(sp)");
-            emit("addi sp, sp, 4");
+            // 双复杂表达式：始终优化栈使用，除非有调用冲突
+            if (enableOptimizations && !expressionContainsCall(expr->right.get()) &&
+                !expressionContainsCall(expr->left.get()))
+            {
+                // 两侧都无调用时，使用临时寄存器避免栈操作
+                generateExpression(expr->right.get());
+                emit("mv t0, a0"); // 使用mv指令更高效
+                generateExpression(expr->left.get());
+                emit("mv a1, t0"); // 使用mv指令更高效
+            }
+            else
+            {
+                // 传统栈方法但用更多临时寄存器优化
+                generateExpression(expr->right.get());
+                emit("addi sp, sp, -4");
+                emit("sw a0, 0(sp)");
+                generateExpression(expr->left.get());
+                emit("lw a1, 0(sp)");
+                emit("addi sp, sp, 4");
+            }
         }
 
         switch (expr->op)
@@ -1888,8 +1901,21 @@ void CodeGenerator::generateVariableExpression(VariableExpression *expr)
     //     return;
     // }
 
-    // 暂时完全禁用寄存器复用，确保正确性
-    // TODO: 需要更精确的活跃性分析
+    // 保守的寄存器复用：只在非循环中启用
+    if (enableOptimizations && !inLoopContext)
+    {
+        if (a0HoldsVariable && a0HeldVarOffset == offset)
+        {
+            return; // a0 中已有当前变量的值
+        }
+        if (a1HoldsVariable && a1HeldVarOffset == offset)
+        {
+            emit("mv a0, a1"); // 从 a1 复制到 a0
+            a0HoldsVariable = true;
+            a0HeldVarOffset = offset;
+            return;
+        }
+    }
 
     emit("lw a0, " + std::to_string(offset) + "(fp)");
     a0HoldsVariable = true;
@@ -1907,8 +1933,68 @@ void CodeGenerator::generateCallExpression(CallExpression *expr)
         return;
     }
 
-        // 暂时禁用复杂的参数优化，使用标准方法
-    // TODO: 需要更仔细的测试和验证
+    // 增强优化：对1-8个简单参数进行直接装载优化，完全避免栈操作
+    if (argCount <= 8 && enableOptimizations)
+    {
+        bool canDirectLoad = true;
+        for (auto &a : expr->arguments)
+        {
+            if (!isSimpleExpr(a.get()) || expressionContainsCall(a.get()))
+            {
+                canDirectLoad = false;
+                break;
+            }
+        }
+
+        if (canDirectLoad)
+        {
+            // 优化：对1-8个参数使用直接装载到寄存器
+            if (argCount == 1)
+            {
+                generateExpression(expr->arguments[0].get()); // 直接到 a0
+            }
+            else if (argCount == 2)
+            {
+                generateExpression(expr->arguments[1].get()); // 先生成第二个到 a0
+                emit("mv a1, a0");                            // 使用mv指令更高效
+                generateExpression(expr->arguments[0].get()); // 再生成第一个到 a0
+            }
+            else if (argCount == 3)
+            {
+                // 3个参数：从后往前生成，避免覆盖
+                generateExpression(expr->arguments[2].get()); // 先生成第三个到 a0
+                emit("mv a2, a0");                            // 使用mv指令
+                generateExpression(expr->arguments[1].get()); // 再生成第二个到 a0
+                emit("mv a1, a0");                            // 使用mv指令
+                generateExpression(expr->arguments[0].get()); // 最后生成第一个到 a0
+            }
+            else if (argCount <= 8)
+            {
+                // 4-8个参数：保守处理，确保参数求值顺序正确
+                // 使用栈暂存参数
+                int tempSpace = argCount * 4;
+                int alignedSpace = (tempSpace + 15) & ~15;
+                emit("addi sp, sp, -" + std::to_string(alignedSpace));
+
+                // 从左到右计算所有参数并存储
+                for (size_t i = 0; i < argCount; i++)
+                {
+                    generateExpression(expr->arguments[i].get());
+                    emit("sw a0, " + std::to_string(i * 4) + "(sp)");
+                }
+
+                // 按顺序加载到寄存器
+                for (size_t i = 0; i < argCount; i++)
+                {
+                    emit("lw a" + std::to_string(i) + ", " + std::to_string(i * 4) + "(sp)");
+                }
+
+                emit("addi sp, sp, " + std::to_string(alignedSpace));
+            }
+            emit("call " + expr->functionName);
+            return;
+        }
+    }
 
     // 快路径：所有实参均为简单表达式且不包含调用，优化处理
     bool allSimple = true;
