@@ -39,6 +39,15 @@ class CodeGenerator
     std::set<std::string> usedVariables;
     bool enableOptimizations = true;
 
+    // 死代码消除
+    std::set<std::string> liveVariables;
+
+    // 常量传播
+    std::unordered_map<std::string, int> constantTable;
+
+    // 公共子表达式消除
+    std::unordered_map<std::string, std::string> exprCache; // 表达式 -> 临时变量
+
     // 基本块内保守寄存器复用：记录 a0/a1 当前是否保存了某个变量槽位的值
     bool a0HoldsVariable = false;
     int a0HeldVarOffset = 0;
@@ -97,6 +106,13 @@ class CodeGenerator
     // 循环优化相关
     bool canOptimizeLoopCondition(Expression *cond);
     void generateOptimizedLoopCondition(Expression *cond, int endLabel);
+
+    // 高级优化
+    void performDeadCodeElimination(BlockStatement *block);
+    void performConstantPropagation(BlockStatement *block);
+    std::string generateCSE(Expression *expr);
+    bool isConstantExpression(Expression *expr);
+    int evaluateConstantExpression(Expression *expr);
 
     std::optional<int> tryConstantFolding(Expression *expr);
     std::optional<int> getPowerOfTwoShift(Expression *expr);
