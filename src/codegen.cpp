@@ -277,8 +277,8 @@ void CodeGenerator::generateFunction(FunctionDeclaration *func)
     variables.clear();
     constantValues.clear();
     usedVariables.clear();
-    constantTable.clear();
-    exprCache.clear();
+    // constantTable.clear();
+    // exprCache.clear();
     stackOffset = 0;
     isUnreachable = false;
     currentFunctionName = func->name;
@@ -287,9 +287,12 @@ void CodeGenerator::generateFunction(FunctionDeclaration *func)
     if (enableOptimizations)
     {
         analyzeVariableUsage(func->body.get());
-        // 暂时禁用新的优化函数，避免段错误
-        // performConstantPropagation(func->body.get());
-        // performDeadCodeElimination(func->body.get());
+        // 暂时禁用高级优化函数，避免段错误
+        // if (func->body.get())
+        // {
+        //     performConstantPropagation(func->body.get());
+        //     performDeadCodeElimination(func->body.get());
+        // }
     }
 
     // Count local variables for stack allocation (including nested blocks)
@@ -544,18 +547,17 @@ void CodeGenerator::generateWhileStatement(WhileStatement *stmt)
     invariantReuseEnabled = false;
     invariantComputeBypass = false;
 
-    // 重新启用循环条件优化（保守版本）
-    if (enableOptimizations && canOptimizeLoopCondition(stmt->condition.get()))
-    {
-        generateOptimizedLoopCondition(stmt->condition.get(), endLabel);
-    }
-    else
-    {
-        // Generate condition normally
-        generateExpression(stmt->condition.get());
-        // Branch if false
-        emit("beqz a0, " + getLabelName(endLabel));
-    }
+            // 保守的循环条件优化
+        if (enableOptimizations && stmt->condition.get() && canOptimizeLoopCondition(stmt->condition.get()))
+        {
+            generateOptimizedLoopCondition(stmt->condition.get(), endLabel);
+        }
+        else if (stmt->condition.get())
+        {
+            // 普通条件处理
+            generateExpression(stmt->condition.get());
+            emit("beqz a0, " + getLabelName(endLabel));
+        }
 
     // Generate body
     isUnreachable = false; // Body is reachable from the condition
@@ -669,12 +671,23 @@ void CodeGenerator::generateExpression(Expression *expr)
         return;
     }
 
-    // 暂时禁用常量表达式优化
-    // if (enableOptimizations && isConstantExpression(expr))
+        // 暂时禁用常量表达式优化，避免段错误
+    // if (enableOptimizations && expr && isConstantExpression(expr))
     // {
     //     int value = evaluateConstantExpression(expr);
     //     emit("li a0, " + std::to_string(value));
     //     return;
+    // }
+    
+    // 暂时禁用CSE，避免段错误
+    // if (enableOptimizations && expr)
+    // {
+    //     std::string cachedResult = generateCSE(expr);
+    //     if (!cachedResult.empty())
+    //     {
+    //         emit("lw a0, " + cachedResult);
+    //         return;
+    //     }
     // }
 
     switch (expr->type)
@@ -2072,13 +2085,25 @@ void CodeGenerator::generateCallExpression(CallExpression *expr)
         return;
     }
 
-    // 重新启用简单的参数优化
+    // 扩展的参数优化：支持更多参数和更智能的处理
     if (argCount <= 3 && enableOptimizations)
     {
         bool canDirectLoad = true;
+        bool hasConstantArgs = false;
+
+        // 检查参数复杂度和常量情况
         for (auto &a : expr->arguments)
         {
-            if (!isSimpleExpr(a.get()) || expressionContainsCall(a.get()))
+            if (expressionContainsCall(a.get()))
+            {
+                canDirectLoad = false;
+                break;
+            }
+            if (isConstantExpression(a.get()))
+            {
+                hasConstantArgs = true;
+            }
+            else if (!isSimpleExpr(a.get()))
             {
                 canDirectLoad = false;
                 break;
@@ -2087,23 +2112,41 @@ void CodeGenerator::generateCallExpression(CallExpression *expr)
 
         if (canDirectLoad)
         {
-            if (argCount == 1)
+            // 对常量参数进行特殊优化
+            if (hasConstantArgs)
             {
-                generateExpression(expr->arguments[0].get());
+                for (size_t i = 0; i < argCount; i++)
+                {
+                    if (isConstantExpression(expr->arguments[i].get()))
+                    {
+                        int value = evaluateConstantExpression(expr->arguments[i].get());
+                        emit("li a" + std::to_string(i) + ", " + std::to_string(value));
+                    }
+                    else
+                    {
+                        generateExpression(expr->arguments[i].get());
+                        if (i > 0)
+                            emit("mv a" + std::to_string(i) + ", a0");
+                    }
+                }
             }
-            else if (argCount == 2)
+            else
             {
-                generateExpression(expr->arguments[1].get());
-                emit("mv a1, a0");
-                generateExpression(expr->arguments[0].get());
-            }
-            else if (argCount == 3)
-            {
-                generateExpression(expr->arguments[2].get());
-                emit("mv a2, a0");
-                generateExpression(expr->arguments[1].get());
-                emit("mv a1, a0");
-                generateExpression(expr->arguments[0].get());
+                // 普通的直接加载
+                if (argCount == 1)
+                {
+                    generateExpression(expr->arguments[0].get());
+                }
+                else
+                {
+                    // 从后往前生成，避免覆盖
+                    for (int i = argCount - 1; i >= 0; i--)
+                    {
+                        generateExpression(expr->arguments[i].get());
+                        if (i > 0)
+                            emit("mv a" + std::to_string(i) + ", a0");
+                    }
+                }
             }
             emit("call " + expr->functionName);
             return;
