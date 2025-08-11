@@ -277,6 +277,8 @@ void CodeGenerator::generateFunction(FunctionDeclaration *func)
     variables.clear();
     constantValues.clear();
     usedVariables.clear();
+    constantTable.clear();
+    exprCache.clear();
     stackOffset = 0;
     isUnreachable = false;
     currentFunctionName = func->name;
@@ -285,6 +287,9 @@ void CodeGenerator::generateFunction(FunctionDeclaration *func)
     if (enableOptimizations)
     {
         analyzeVariableUsage(func->body.get());
+        // 暂时禁用新的优化函数，避免段错误
+        // performConstantPropagation(func->body.get());
+        // performDeadCodeElimination(func->body.get());
     }
 
     // Count local variables for stack allocation (including nested blocks)
@@ -539,11 +544,18 @@ void CodeGenerator::generateWhileStatement(WhileStatement *stmt)
     invariantReuseEnabled = false;
     invariantComputeBypass = false;
 
-    // 暂时禁用循环条件优化，使用标准生成
-    // Generate condition normally
-    generateExpression(stmt->condition.get());
-    // Branch if false
-    emit("beqz a0, " + getLabelName(endLabel));
+    // 重新启用循环条件优化（保守版本）
+    if (enableOptimizations && canOptimizeLoopCondition(stmt->condition.get()))
+    {
+        generateOptimizedLoopCondition(stmt->condition.get(), endLabel);
+    }
+    else
+    {
+        // Generate condition normally
+        generateExpression(stmt->condition.get());
+        // Branch if false
+        emit("beqz a0, " + getLabelName(endLabel));
+    }
 
     // Generate body
     isUnreachable = false; // Body is reachable from the condition
@@ -654,9 +666,16 @@ void CodeGenerator::generateExpression(Expression *expr)
     if (auto constValue = tryConstantFolding(expr))
     {
         emit("li a0, " + std::to_string(*constValue));
-        // 常量不进入缓存
         return;
     }
+
+    // 暂时禁用常量表达式优化
+    // if (enableOptimizations && isConstantExpression(expr))
+    // {
+    //     int value = evaluateConstantExpression(expr);
+    //     emit("li a0, " + std::to_string(value));
+    //     return;
+    // }
 
     switch (expr->type)
     {
@@ -1475,26 +1494,13 @@ void CodeGenerator::generateBinaryExpression(BinaryExpression *expr)
         }
         else
         {
-            // 双复杂表达式：始终优化栈使用，除非有调用冲突
-            if (enableOptimizations && !expressionContainsCall(expr->right.get()) &&
-                !expressionContainsCall(expr->left.get()))
-            {
-                // 两侧都无调用时，使用临时寄存器避免栈操作
-                generateExpression(expr->right.get());
-                emit("mv t0, a0"); // 使用mv指令更高效
-                generateExpression(expr->left.get());
-                emit("mv a1, t0"); // 使用mv指令更高效
-            }
-            else
-            {
-                // 传统栈方法但用更多临时寄存器优化
-                generateExpression(expr->right.get());
-                emit("addi sp, sp, -4");
-                emit("sw a0, 0(sp)");
-                generateExpression(expr->left.get());
-                emit("lw a1, 0(sp)");
-                emit("addi sp, sp, 4");
-            }
+            // 使用标准栈方法，确保正确性
+            generateExpression(expr->right.get());
+            emit("addi sp, sp, -4");
+            emit("sw a0, 0(sp)");
+            generateExpression(expr->left.get());
+            emit("lw a1, 0(sp)");
+            emit("addi sp, sp, 4");
         }
 
         switch (expr->op)
@@ -1861,6 +1867,152 @@ void CodeGenerator::generateOptimizedLoopCondition(Expression *cond, int endLabe
     }
 }
 
+// 死代码消除
+void CodeGenerator::performDeadCodeElimination(BlockStatement *block)
+{
+    if (!block || !enableOptimizations)
+        return;
+
+    // 简单的死代码消除：删除return后的代码
+    bool foundReturn = false;
+    for (auto it = block->statements.begin(); it != block->statements.end();)
+    {
+        if (foundReturn)
+        {
+            // 删除return后的代码
+            it = block->statements.erase(it);
+        }
+        else
+        {
+            if ((*it)->type == NodeType::RETURN_STMT)
+            {
+                foundReturn = true;
+            }
+            ++it;
+        }
+    }
+}
+
+// 常量传播
+void CodeGenerator::performConstantPropagation(BlockStatement *block)
+{
+    if (!block || !enableOptimizations)
+        return;
+
+    // 简单的常量传播：记录常量赋值
+    for (auto &stmt : block->statements)
+    {
+        if (stmt->type == NodeType::ASSIGN_STMT)
+        {
+            auto *assign = static_cast<AssignStatement *>(stmt.get());
+            if (assign->expression->type == NodeType::LITERAL_EXPR)
+            {
+                auto *literal = static_cast<LiteralExpression *>(assign->expression.get());
+                constantTable[assign->variable] = literal->value;
+            }
+        }
+    }
+}
+
+// 公共子表达式消除
+std::string CodeGenerator::generateCSE(Expression *expr)
+{
+    if (!expr || !enableOptimizations)
+        return "";
+
+    // 简化的CSE：仅处理二元表达式
+    if (expr->type == NodeType::BINARY_EXPR)
+    {
+        auto *binExpr = static_cast<BinaryExpression *>(expr);
+        if (binExpr->left->type == NodeType::VARIABLE_EXPR &&
+            binExpr->right->type == NodeType::LITERAL_EXPR)
+        {
+            auto *leftVar = static_cast<VariableExpression *>(binExpr->left.get());
+            auto *rightLit = static_cast<LiteralExpression *>(binExpr->right.get());
+
+            std::string exprKey = leftVar->name +
+                                  (binExpr->op == BinaryOp::ADD   ? "+"
+                                   : binExpr->op == BinaryOp::SUB ? "-"
+                                   : binExpr->op == BinaryOp::MUL ? "*"
+                                                                  : "?") +
+                                  std::to_string(rightLit->value);
+
+            if (exprCache.find(exprKey) != exprCache.end())
+            {
+                return exprCache[exprKey];
+            }
+        }
+    }
+    return "";
+}
+
+// 检查是否为常量表达式
+bool CodeGenerator::isConstantExpression(Expression *expr)
+{
+    if (!expr)
+        return false;
+
+    switch (expr->type)
+    {
+    case NodeType::LITERAL_EXPR:
+        return true;
+    case NodeType::VARIABLE_EXPR: {
+        auto *varExpr = static_cast<VariableExpression *>(expr);
+        return constantTable.find(varExpr->name) != constantTable.end();
+    }
+    case NodeType::BINARY_EXPR: {
+        auto *binExpr = static_cast<BinaryExpression *>(expr);
+        return isConstantExpression(binExpr->left.get()) &&
+               isConstantExpression(binExpr->right.get());
+    }
+    default:
+        return false;
+    }
+}
+
+// 计算常量表达式的值
+int CodeGenerator::evaluateConstantExpression(Expression *expr)
+{
+    if (!expr)
+        return 0;
+
+    switch (expr->type)
+    {
+    case NodeType::LITERAL_EXPR:
+        return static_cast<LiteralExpression *>(expr)->value;
+    case NodeType::VARIABLE_EXPR: {
+        auto *varExpr = static_cast<VariableExpression *>(expr);
+        auto it = constantTable.find(varExpr->name);
+        if (it != constantTable.end())
+            return it->second;
+        return 0;
+    }
+    case NodeType::BINARY_EXPR: {
+        auto *binExpr = static_cast<BinaryExpression *>(expr);
+        int left = evaluateConstantExpression(binExpr->left.get());
+        int right = evaluateConstantExpression(binExpr->right.get());
+
+        switch (binExpr->op)
+        {
+        case BinaryOp::ADD:
+            return left + right;
+        case BinaryOp::SUB:
+            return left - right;
+        case BinaryOp::MUL:
+            return left * right;
+        case BinaryOp::DIV:
+            return right != 0 ? left / right : 0;
+        case BinaryOp::MOD:
+            return right != 0 ? left % right : 0;
+        default:
+            return 0;
+        }
+    }
+    default:
+        return 0;
+    }
+}
+
 void CodeGenerator::generateUnaryExpression(UnaryExpression *expr)
 {
     generateExpression(expr->operand.get());
@@ -1901,21 +2053,8 @@ void CodeGenerator::generateVariableExpression(VariableExpression *expr)
     //     return;
     // }
 
-    // 保守的寄存器复用：只在非循环中启用
-    if (enableOptimizations && !inLoopContext)
-    {
-        if (a0HoldsVariable && a0HeldVarOffset == offset)
-        {
-            return; // a0 中已有当前变量的值
-        }
-        if (a1HoldsVariable && a1HeldVarOffset == offset)
-        {
-            emit("mv a0, a1"); // 从 a1 复制到 a0
-            a0HoldsVariable = true;
-            a0HeldVarOffset = offset;
-            return;
-        }
-    }
+    // 暂时完全禁用寄存器复用，确保正确性
+    // TODO: 需要更精确的活跃性分析
 
     emit("lw a0, " + std::to_string(offset) + "(fp)");
     a0HoldsVariable = true;
@@ -1933,8 +2072,8 @@ void CodeGenerator::generateCallExpression(CallExpression *expr)
         return;
     }
 
-    // 增强优化：对1-8个简单参数进行直接装载优化，完全避免栈操作
-    if (argCount <= 8 && enableOptimizations)
+    // 重新启用简单的参数优化
+    if (argCount <= 3 && enableOptimizations)
     {
         bool canDirectLoad = true;
         for (auto &a : expr->arguments)
@@ -1948,48 +2087,23 @@ void CodeGenerator::generateCallExpression(CallExpression *expr)
 
         if (canDirectLoad)
         {
-            // 优化：对1-8个参数使用直接装载到寄存器
             if (argCount == 1)
             {
-                generateExpression(expr->arguments[0].get()); // 直接到 a0
+                generateExpression(expr->arguments[0].get());
             }
             else if (argCount == 2)
             {
-                generateExpression(expr->arguments[1].get()); // 先生成第二个到 a0
-                emit("mv a1, a0");                            // 使用mv指令更高效
-                generateExpression(expr->arguments[0].get()); // 再生成第一个到 a0
+                generateExpression(expr->arguments[1].get());
+                emit("mv a1, a0");
+                generateExpression(expr->arguments[0].get());
             }
             else if (argCount == 3)
             {
-                // 3个参数：从后往前生成，避免覆盖
-                generateExpression(expr->arguments[2].get()); // 先生成第三个到 a0
-                emit("mv a2, a0");                            // 使用mv指令
-                generateExpression(expr->arguments[1].get()); // 再生成第二个到 a0
-                emit("mv a1, a0");                            // 使用mv指令
-                generateExpression(expr->arguments[0].get()); // 最后生成第一个到 a0
-            }
-            else if (argCount <= 8)
-            {
-                // 4-8个参数：保守处理，确保参数求值顺序正确
-                // 使用栈暂存参数
-                int tempSpace = argCount * 4;
-                int alignedSpace = (tempSpace + 15) & ~15;
-                emit("addi sp, sp, -" + std::to_string(alignedSpace));
-
-                // 从左到右计算所有参数并存储
-                for (size_t i = 0; i < argCount; i++)
-                {
-                    generateExpression(expr->arguments[i].get());
-                    emit("sw a0, " + std::to_string(i * 4) + "(sp)");
-                }
-
-                // 按顺序加载到寄存器
-                for (size_t i = 0; i < argCount; i++)
-                {
-                    emit("lw a" + std::to_string(i) + ", " + std::to_string(i * 4) + "(sp)");
-                }
-
-                emit("addi sp, sp, " + std::to_string(alignedSpace));
+                generateExpression(expr->arguments[2].get());
+                emit("mv a2, a0");
+                generateExpression(expr->arguments[1].get());
+                emit("mv a1, a0");
+                generateExpression(expr->arguments[0].get());
             }
             emit("call " + expr->functionName);
             return;
