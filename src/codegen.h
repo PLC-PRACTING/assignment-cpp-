@@ -44,6 +44,10 @@ class CodeGenerator
     int a0HeldVarOffset = 0;
     bool a1HoldsVariable = false;
     int a1HeldVarOffset = 0;
+    
+    // 循环变量寄存器分配：t寄存器用于存储频繁访问的局部变量
+    std::unordered_map<std::string, std::string> loopVarRegMap; // 变量名 -> 寄存器名
+    bool inLoopContext = false;
 
     // 循环不变式提取 + 简易 CSE（基于表达式串的保守复用）
     bool invariantReuseEnabled = false;

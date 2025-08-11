@@ -1429,8 +1429,37 @@ void CodeGenerator::generateBinaryExpression(BinaryExpression *expr)
             emit("or a0, a0, a1");
             break;
         case BinaryOp::MUL:
-            // 乘以小常量（右值是常量时已在前面处理）；
-            // 这里处理左值为常量的情形
+            // 扩展乘法优化：更多特殊常量
+            if (auto rv = tryConstantFolding(expr->right.get()))
+            {
+                int c = *rv;
+                if (c == 0) {
+                    emit("li a0, 0");
+                    break;
+                } else if (c == 1) {
+                    // a0 保持不变
+                    break;
+                } else if (c == -1) {
+                    emit("neg a0, a0");
+                    break;
+                } else if (c == 3) {
+                    // x * 3 = x + 2x = x + (x << 1)
+                    emit("slli a1, a0, 1");
+                    emit("add a0, a0, a1");
+                    break;
+                } else if (c == 5) {
+                    // x * 5 = x + 4x = x + (x << 2)
+                    emit("slli a1, a0, 2");
+                    emit("add a0, a0, a1");
+                    break;
+                } else if (c == 9) {
+                    // x * 9 = x + 8x = x + (x << 3)
+                    emit("slli a1, a0, 3");
+                    emit("add a0, a0, a1");
+                    break;
+                }
+            }
+            // 左值常量情形
             if (auto lv = tryConstantFolding(expr->left.get()))
             {
                 int c = *lv;
@@ -1591,6 +1620,18 @@ void CodeGenerator::generateVariableExpression(VariableExpression *expr)
 {
     int offset = getVariableOffset(expr->name);
     
+    // 激进优化：检查变量是否已分配到循环寄存器
+    if (enableOptimizations && inLoopContext) {
+        auto it = loopVarRegMap.find(expr->name);
+        if (it != loopVarRegMap.end()) {
+            // 变量已分配到寄存器，直接使用
+            emit("addi a0, " + it->second + ", 0");
+            a0HoldsVariable = true;
+            a0HeldVarOffset = offset;
+            return;
+        }
+    }
+    
     // 改进的寄存器复用：检查 a0 和 a1 是否已加载了该变量
     if (enableOptimizations) {
         if (a0HoldsVariable && a0HeldVarOffset == offset) {
@@ -1620,7 +1661,60 @@ void CodeGenerator::generateCallExpression(CallExpression *expr)
         return;
     }
 
-    // 快路径：所有实参均为简单表达式且不包含调用，直接填充寄存器和溢出区
+    // 激进优化：对于少量简单参数，完全避免栈分配
+    if (argCount <= 4 && enableOptimizations)
+    {
+        bool canDirectLoad = true;
+        for (auto &a : expr->arguments)
+        {
+            if (!isSimpleExpr(a.get()) || expressionContainsCall(a.get()))
+            {
+                canDirectLoad = false;
+                break;
+            }
+        }
+        
+        if (canDirectLoad)
+        {
+            // 直接装入参数寄存器，无需任何栈操作
+            for (size_t i = 0; i < argCount; i++)
+            {
+                if (i == 0) {
+                    if (auto *litExpr = dynamic_cast<LiteralExpression*>(expr->arguments[i].get())) {
+                        emit("li a0, " + std::to_string(litExpr->value));
+                    } else if (auto *varExpr = dynamic_cast<VariableExpression*>(expr->arguments[i].get())) {
+                        int offset = getVariableOffset(varExpr->name);
+                        emit("lw a0, " + std::to_string(offset) + "(fp)");
+                    }
+                } else if (i == 1) {
+                    if (auto *litExpr = dynamic_cast<LiteralExpression*>(expr->arguments[i].get())) {
+                        emit("li a1, " + std::to_string(litExpr->value));
+                    } else if (auto *varExpr = dynamic_cast<VariableExpression*>(expr->arguments[i].get())) {
+                        int offset = getVariableOffset(varExpr->name);
+                        emit("lw a1, " + std::to_string(offset) + "(fp)");
+                    }
+                } else if (i == 2) {
+                    if (auto *litExpr = dynamic_cast<LiteralExpression*>(expr->arguments[i].get())) {
+                        emit("li a2, " + std::to_string(litExpr->value));
+                    } else if (auto *varExpr = dynamic_cast<VariableExpression*>(expr->arguments[i].get())) {
+                        int offset = getVariableOffset(varExpr->name);
+                        emit("lw a2, " + std::to_string(offset) + "(fp)");
+                    }
+                } else if (i == 3) {
+                    if (auto *litExpr = dynamic_cast<LiteralExpression*>(expr->arguments[i].get())) {
+                        emit("li a3, " + std::to_string(litExpr->value));
+                    } else if (auto *varExpr = dynamic_cast<VariableExpression*>(expr->arguments[i].get())) {
+                        int offset = getVariableOffset(varExpr->name);
+                        emit("lw a3, " + std::to_string(offset) + "(fp)");
+                    }
+                }
+            }
+            emit("call " + expr->functionName);
+            return;
+        }
+    }
+
+    // 快路径：所有实参均为简单表达式且不包含调用，直接填充寄存器和溢出区  
     bool allSimple = true;
     for (auto &a : expr->arguments)
     {
