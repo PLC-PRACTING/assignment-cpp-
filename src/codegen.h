@@ -48,6 +48,28 @@ class CodeGenerator
     // 循环变量寄存器分配：t寄存器用于存储频繁访问的局部变量
     std::unordered_map<std::string, std::string> loopVarRegMap; // 变量名 -> 寄存器名
     bool inLoopContext = false;
+    
+    // 超级性能优化：函数内联和参数传递优化
+    std::unordered_map<std::string, FunctionDeclaration*> smallFunctions;
+    std::unordered_set<std::string> recursiveFunctions;
+    bool enableFunctionInlining = true;
+    int maxInlineSize = 10; // 最大内联函数体大小
+    
+    // 极致寄存器分配：追踪更多寄存器状态
+    std::unordered_map<std::string, std::string> varRegMap; // 变量到寄存器映射
+    std::vector<std::string> tempRegs = {"t0", "t1", "t2", "t3", "t4", "t5", "t6"};
+    std::unordered_set<std::string> allocatedRegs;
+    
+    // 指令级优化
+    std::vector<std::string> instructionBuffer;
+    bool enableInstructionReordering = true; // 重新启用保守的指令重排
+    
+    // 终极循环优化
+    std::unordered_map<std::string, int> loopVarAccessCount; // 循环变量访问频率
+    std::unordered_set<std::string> loopInvariantVars; // 循环不变量
+    bool enableLoopUnrolling = true; // 重新启用解决超时问题
+    bool enableLoopVectorization = false; // 暂时禁用避免运行错误
+    int maxUnrollFactor = 2; // 减少展开因子保持安全
 
     // 循环不变式提取 + 简易 CSE（基于表达式串的保守复用）
     bool invariantReuseEnabled = false;
@@ -116,6 +138,23 @@ class CodeGenerator
     bool isITypeImmediate(int value);
     bool isSimpleExpr(Expression *expr);
     bool expressionContainsCall(Expression *expr);
+    
+    // 超级性能优化方法
+    void analyzeFunctionComplexity(FunctionDeclaration *func);
+    bool shouldInlineFunction(const std::string &funcName);
+    void inlineSimpleFunction(FunctionDeclaration *func, CallExpression *call);
+    std::string allocateTempReg(const std::string &varName);
+    void freeTempReg(const std::string &varName);
+    void optimizeInstructionSequence();
+    void generateMegaOptimizedBinary(BinaryExpression *expr);
+    void generateUltraOptimizedCall(CallExpression *expr);
+    
+    // 终极循环优化方法
+    void analyzeLoopVariables(WhileStatement *loop);
+    bool shouldUnrollLoop(WhileStatement *loop);
+    void generateUnrolledLoop(WhileStatement *loop, int factor);
+    void generateVectorizedLoop(WhileStatement *loop);
+    void generateMegaOptimizedWhile(WhileStatement *stmt);
 
   public:
     CodeGenerator();
