@@ -383,16 +383,11 @@ void CodeGenerator::generateFunction(FunctionDeclaration *func)
     // 生成标准序言（经过验证更稳健）
     generateFunctionPrologue(func->name, totalLocals);
 
-    // 优化：只保存真正被使用的参数
+    // 保守地保存所有参数，确保正确性
     for (size_t i = 0; i < func->parameters.size() && i < 8; i++)
     {
-        // 检查参数是否被使用（通过usedVariables检查）
-        const std::string &paramName = func->parameters[i].name;
-        if (!enableOptimizations || usedVariables.find(paramName) != usedVariables.end())
-        {
-            int offset = getVariableOffset(paramName);
-            emit("sw a" + std::to_string(i) + ", " + std::to_string(offset) + "(fp)");
-        }
+        int offset = getVariableOffset(func->parameters[i].name);
+        emit("sw a" + std::to_string(i) + ", " + std::to_string(offset) + "(fp)");
     }
     invalidateA0Cache();
 
@@ -544,18 +539,11 @@ void CodeGenerator::generateWhileStatement(WhileStatement *stmt)
     invariantReuseEnabled = false;
     invariantComputeBypass = false;
 
-    // 优化循环条件生成
-    if (enableOptimizations && canOptimizeLoopCondition(stmt->condition.get()))
-    {
-        generateOptimizedLoopCondition(stmt->condition.get(), endLabel);
-    }
-    else
-    {
-        // Generate condition normally
-        generateExpression(stmt->condition.get());
-        // Branch if false
-        emit("beqz a0, " + getLabelName(endLabel));
-    }
+    // 暂时禁用循环条件优化，使用标准生成
+    // Generate condition normally
+    generateExpression(stmt->condition.get());
+    // Branch if false
+    emit("beqz a0, " + getLabelName(endLabel));
 
     // Generate body
     isUnreachable = false; // Body is reachable from the condition
@@ -577,27 +565,8 @@ void CodeGenerator::generateWhileStatement(WhileStatement *stmt)
 
 void CodeGenerator::generateReturnStatement(ReturnStatement *stmt)
 {
-    // 尾递归优化：检查是否可以转换为循环
-    if (enableOptimizations && stmt->expression && stmt->expression->type == NodeType::CALL_EXPR)
-    {
-        auto *callExpr = static_cast<CallExpression *>(stmt->expression.get());
-        if (callExpr->functionName == currentFunctionName)
-        {
-            // 尾递归调用：直接更新参数并跳转到函数开始
-            // 简化实现：仅处理单参数情况
-            if (callExpr->arguments.size() == 1 && currentFunctionBodyLabel >= 0)
-            {
-                // 生成新参数值
-                generateExpression(callExpr->arguments[0].get());
-                // 保存到参数位置（假设第一个参数在-12(fp)）
-                emit("sw a0, -12(fp)");
-                // 跳转到函数体开始
-                emit("j " + getLabelName(currentFunctionBodyLabel));
-                isUnreachable = true;
-                return;
-            }
-        }
-    }
+    // 暂时禁用尾递归优化，因为可能引入bug
+    // TODO: 需要更完善的尾递归检测和优化
 
     if (stmt->expression)
     {
@@ -1506,26 +1475,13 @@ void CodeGenerator::generateBinaryExpression(BinaryExpression *expr)
         }
         else
         {
-            // 双复杂表达式：始终优化栈使用，除非有调用冲突
-            if (enableOptimizations && !expressionContainsCall(expr->right.get()) &&
-                !expressionContainsCall(expr->left.get()))
-            {
-                // 两侧都无调用时，使用临时寄存器避免栈操作
-                generateExpression(expr->right.get());
-                emit("mv t0, a0"); // 使用mv指令更高效
-                generateExpression(expr->left.get());
-                emit("mv a1, t0"); // 使用mv指令更高效
-            }
-            else
-            {
-                // 传统栈方法但用更多临时寄存器优化
-                generateExpression(expr->right.get());
-                emit("addi sp, sp, -4");
-                emit("sw a0, 0(sp)");
-                generateExpression(expr->left.get());
-                emit("lw a1, 0(sp)");
-                emit("addi sp, sp, 4");
-            }
+            // 使用标准栈方法，确保正确性
+            generateExpression(expr->right.get());
+            emit("addi sp, sp, -4");
+            emit("sw a0, 0(sp)");
+            generateExpression(expr->left.get());
+            emit("lw a1, 0(sp)");
+            emit("addi sp, sp, 4");
         }
 
         switch (expr->op)
@@ -1919,34 +1875,21 @@ void CodeGenerator::generateVariableExpression(VariableExpression *expr)
 {
     int offset = getVariableOffset(expr->name);
 
-    // 循环中的变量优化：将频繁访问的变量保存在寄存器中
-    if (enableOptimizations && inLoopContext &&
-        loopVarRegMap.find(expr->name) != loopVarRegMap.end())
-    {
-        // 变量已经在寄存器中
-        const std::string &reg = loopVarRegMap[expr->name];
-        if (reg != "a0")
-        {
-            emit("mv a0, " + reg);
-        }
-        return;
-    }
+    // 暂时禁用循环变量寄存器优化
+    // TODO: 需要更完善的活跃性分析
+    // if (enableOptimizations && inLoopContext &&
+    //     loopVarRegMap.find(expr->name) != loopVarRegMap.end())
+    // {
+    //     const std::string &reg = loopVarRegMap[expr->name];
+    //     if (reg != "a0")
+    //     {
+    //         emit("mv a0, " + reg);
+    //     }
+    //     return;
+    // }
 
-    // 改进的寄存器复用：检查 a0 和 a1 是否已加载了该变量
-    if (enableOptimizations)
-    {
-        if (a0HoldsVariable && a0HeldVarOffset == offset)
-        {
-            return; // a0 中已有当前变量的值
-        }
-        if (a1HoldsVariable && a1HeldVarOffset == offset)
-        {
-            emit("mv a0, a1"); // 从 a1 复制到 a0，比 lw 更快
-            a0HoldsVariable = true;
-            a0HeldVarOffset = offset;
-            return;
-        }
-    }
+    // 暂时完全禁用寄存器复用，确保正确性
+    // TODO: 需要更精确的活跃性分析
 
     emit("lw a0, " + std::to_string(offset) + "(fp)");
     a0HoldsVariable = true;
@@ -1964,68 +1907,8 @@ void CodeGenerator::generateCallExpression(CallExpression *expr)
         return;
     }
 
-    // 增强优化：对1-8个简单参数进行直接装载优化，完全避免栈操作
-    if (argCount <= 8 && enableOptimizations)
-    {
-        bool canDirectLoad = true;
-        for (auto &a : expr->arguments)
-        {
-            if (!isSimpleExpr(a.get()) || expressionContainsCall(a.get()))
-            {
-                canDirectLoad = false;
-                break;
-            }
-        }
-
-        if (canDirectLoad)
-        {
-            // 优化：对1-8个参数使用直接装载到寄存器
-            if (argCount == 1)
-            {
-                generateExpression(expr->arguments[0].get()); // 直接到 a0
-            }
-            else if (argCount == 2)
-            {
-                generateExpression(expr->arguments[1].get()); // 先生成第二个到 a0
-                emit("mv a1, a0");                            // 使用mv指令更高效
-                generateExpression(expr->arguments[0].get()); // 再生成第一个到 a0
-            }
-            else if (argCount == 3)
-            {
-                // 3个参数：从后往前生成，避免覆盖
-                generateExpression(expr->arguments[2].get()); // 先生成第三个到 a0
-                emit("mv a2, a0");                            // 使用mv指令
-                generateExpression(expr->arguments[1].get()); // 再生成第二个到 a0
-                emit("mv a1, a0");                            // 使用mv指令
-                generateExpression(expr->arguments[0].get()); // 最后生成第一个到 a0
-            }
-            else if (argCount <= 8)
-            {
-                // 4-8个参数：优化处理，使用最少的指令
-                // 使用栈暂存参数，然后一次性加载
-                int tempSpace = argCount * 4;
-                int alignedSpace = (tempSpace + 15) & ~15;
-                emit("addi sp, sp, -" + std::to_string(alignedSpace));
-
-                // 计算所有参数并存储
-                for (size_t i = 0; i < argCount; i++)
-                {
-                    generateExpression(expr->arguments[i].get());
-                    emit("sw a0, " + std::to_string(i * 4) + "(sp)");
-                }
-
-                // 加载到寄存器
-                for (size_t i = 0; i < argCount; i++)
-                {
-                    emit("lw a" + std::to_string(i) + ", " + std::to_string(i * 4) + "(sp)");
-                }
-
-                emit("addi sp, sp, " + std::to_string(alignedSpace));
-            }
-            emit("call " + expr->functionName);
-            return;
-        }
-    }
+        // 暂时禁用复杂的参数优化，使用标准方法
+    // TODO: 需要更仔细的测试和验证
 
     // 快路径：所有实参均为简单表达式且不包含调用，优化处理
     bool allSimple = true;
