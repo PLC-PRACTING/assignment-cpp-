@@ -70,6 +70,10 @@ class CodeGenerator
     bool invariantReuseEnabled = false;
     bool invariantComputeBypass = false; // 预计算阶段不从缓存复用
     std::unordered_map<std::string, int> invariantExprToOffset;
+    
+    // 增强的公共子表达式消除
+    std::unordered_map<std::string, int> exprCache; // 表达式字符串 -> 栈偏移
+    std::unordered_map<std::string, std::string> exprRegCache; // 表达式字符串 -> 寄存器名
 
     void emit(const std::string &instruction);
     void emitLabel(const std::string &label);

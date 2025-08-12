@@ -353,6 +353,11 @@ void CodeGenerator::generateFunction(FunctionDeclaration *func)
     }
     invalidateA0Cache();
 
+    // 死代码消除：分析变量使用情况
+    if (enableOptimizations && func->body && func->body->type == NodeType::BLOCK_STMT) {
+        analyzeVariableUsage(static_cast<BlockStatement *>(func->body.get()));
+    }
+
     // 标记函数体起始位置，便于尾调用跳转
     emitLabel(getLabelName(currentFunctionBodyLabel));
     generateStatement(func->body.get());
@@ -392,10 +397,16 @@ void CodeGenerator::generateStatement(Statement *stmt)
         generateContinueStatement(static_cast<ContinueStatement *>(stmt));
         break;
     case NodeType::ASSIGN_STMT:
-        generateAssignStatement(static_cast<AssignStatement *>(stmt));
+        // 死代码消除：跳过对未使用变量的赋值
+        if (!isDeadCode(stmt)) {
+            generateAssignStatement(static_cast<AssignStatement *>(stmt));
+        }
         break;
     case NodeType::VAR_DECL_STMT:
-        generateVarDeclStatement(static_cast<VarDeclStatement *>(stmt));
+        // 死代码消除：跳过未使用的变量声明
+        if (!isDeadCode(stmt)) {
+            generateVarDeclStatement(static_cast<VarDeclStatement *>(stmt));
+        }
         break;
     case NodeType::EXPR_STMT:
         generateExpressionStatement(static_cast<ExpressionStatement *>(stmt));
@@ -438,6 +449,24 @@ void CodeGenerator::generateBlockStatement(BlockStatement *stmt)
 
 void CodeGenerator::generateIfStatement(IfStatement *stmt)
 {
+    // 常量条件优化
+    if (enableOptimizations) {
+        auto constCondition = tryConstantFolding(stmt->condition.get());
+        if (constCondition.has_value()) {
+            if (*constCondition != 0) {
+                // 条件总是真，只生成then分支
+                generateStatement(stmt->thenStmt.get());
+                return;
+            } else {
+                // 条件总是假，只生成else分支（如果有）
+                if (stmt->elseStmt) {
+                    generateStatement(stmt->elseStmt.get());
+                }
+                return;
+            }
+        }
+    }
+
     int elseLabel = nextLabel();
     int endLabel = nextLabel();
 
@@ -473,6 +502,18 @@ void CodeGenerator::generateIfStatement(IfStatement *stmt)
 
 void CodeGenerator::generateWhileStatement(WhileStatement *stmt)
 {
+    // 常量条件优化
+    if (enableOptimizations) {
+        auto constCondition = tryConstantFolding(stmt->condition.get());
+        if (constCondition.has_value()) {
+            if (*constCondition == 0) {
+                // 条件总是假，跳过整个循环
+                return;
+            }
+            // 如果条件总是真，生成无限循环（这可能不安全，保持原逻辑）
+        }
+    }
+
     int startLabel = nextLabel();
     int endLabel = nextLabel();
 
@@ -485,6 +526,11 @@ void CodeGenerator::generateWhileStatement(WhileStatement *stmt)
     invariantExprToOffset.clear();
     invariantReuseEnabled = false;
     invariantComputeBypass = false;
+    
+    // 在循环中清除常量值缓存，避免错误的常量传播
+    if (enableOptimizations) {
+        constantValues.clear();
+    }
 
     // Generate condition
     generateExpression(stmt->condition.get());
@@ -591,6 +637,25 @@ void CodeGenerator::generateExpression(Expression *expr)
     if (!expr)
         return;
 
+    // 增强的公共子表达式消除
+    if (enableOptimizations && expr->type != NodeType::VARIABLE_EXPR && expr->type != NodeType::LITERAL_EXPR) {
+        auto key = serializeExpr(expr);
+        
+        // 检查寄存器缓存
+        auto regIt = exprRegCache.find(key);
+        if (regIt != exprRegCache.end()) {
+            emit("addi a0, " + regIt->second + ", 0"); // mv a0, cached_reg
+            return;
+        }
+        
+        // 检查栈缓存
+        auto stackIt = exprCache.find(key);
+        if (stackIt != exprCache.end()) {
+            emit("lw a0, " + std::to_string(stackIt->second) + "(fp)");
+            return;
+        }
+    }
+
     // 简易 CSE：当循环复用开启且表达式可序列化命中缓存，直接从缓存槽加载
     if (invariantReuseEnabled && !invariantComputeBypass)
     {
@@ -670,6 +735,33 @@ std::optional<int> CodeGenerator::tryConstantFolding(Expression *expr)
     }
     case NodeType::BINARY_EXPR: {
         auto binExpr = static_cast<BinaryExpression *>(expr);
+        
+        // 特殊处理短路逻辑运算
+        if (binExpr->op == BinaryOp::AND || binExpr->op == BinaryOp::OR) {
+            auto leftVal = tryConstantFolding(binExpr->left.get());
+            if (leftVal) {
+                if (binExpr->op == BinaryOp::AND && *leftVal == 0) {
+                    // 左操作数为假，短路返回假，不计算右操作数
+                    return 0;
+                }
+                if (binExpr->op == BinaryOp::OR && *leftVal != 0) {
+                    // 左操作数为真，短路返回真，不计算右操作数
+                    return 1;
+                }
+                // 需要计算右操作数
+                auto rightVal = tryConstantFolding(binExpr->right.get());
+                if (rightVal) {
+                    if (binExpr->op == BinaryOp::AND) {
+                        return *rightVal != 0 ? 1 : 0;
+                    } else { // BinaryOp::OR
+                        return *rightVal != 0 ? 1 : 0;
+                    }
+                }
+            }
+            return std::nullopt;
+        }
+        
+        // 非短路运算，正常计算两个操作数
         auto leftVal = tryConstantFolding(binExpr->left.get());
         auto rightVal = tryConstantFolding(binExpr->right.get());
 
@@ -703,14 +795,8 @@ std::optional<int> CodeGenerator::tryConstantFolding(Expression *expr)
                 return *leftVal == *rightVal;
             case BinaryOp::NE:
                 return *leftVal != *rightVal;
-            case BinaryOp::AND:
-                // 短路求值：如果左操作数为假，结果为假
-                if (*leftVal == 0) return 0;
-                return *rightVal != 0 ? 1 : 0;
-            case BinaryOp::OR:
-                // 短路求值：如果左操作数为真，结果为真  
-                if (*leftVal != 0) return 1;
-                return *rightVal != 0 ? 1 : 0;
+            default:
+                break;
             }
         }
         break;
@@ -818,14 +904,7 @@ bool CodeGenerator::isITypeImmediate(int value)
     return value >= -2048 && value <= 2047;
 }
 
-bool CodeGenerator::isSimpleExpr(Expression *expr)
-{
-    if (!expr)
-        return false;
-    return expr->type == NodeType::LITERAL_EXPR || expr->type == NodeType::VARIABLE_EXPR;
-}
-
-static bool exprHasCallRecursive(Expression *expr)
+bool exprHasCallRecursive(Expression *expr)
 {
     if (!expr)
         return false;
@@ -841,6 +920,42 @@ static bool exprHasCallRecursive(Expression *expr)
     }
     default:
         return false;
+    }
+}
+
+bool CodeGenerator::isSimpleExpr(Expression *expr)
+{
+    if (!expr)
+        return false;
+    
+    switch (expr->type) {
+        case NodeType::LITERAL_EXPR:
+        case NodeType::VARIABLE_EXPR:
+            return true;
+        case NodeType::BINARY_EXPR:
+            if (enableOptimizations) {
+                auto *binExpr = static_cast<BinaryExpression *>(expr);
+                // 如果是简单的算术或比较运算，且操作数都是简单表达式，认为整体也是简单的
+                if ((binExpr->op == BinaryOp::ADD || binExpr->op == BinaryOp::SUB || 
+                     binExpr->op == BinaryOp::MUL || binExpr->op == BinaryOp::DIV ||
+                     binExpr->op == BinaryOp::MOD || binExpr->op == BinaryOp::LT ||
+                     binExpr->op == BinaryOp::LE || binExpr->op == BinaryOp::GT ||
+                     binExpr->op == BinaryOp::GE || binExpr->op == BinaryOp::EQ ||
+                     binExpr->op == BinaryOp::NE) &&
+                    isSimpleExpr(binExpr->left.get()) && isSimpleExpr(binExpr->right.get()) &&
+                    !exprHasCallRecursive(binExpr)) {
+                    return true;
+                }
+            }
+            return false;
+        case NodeType::UNARY_EXPR:
+            if (enableOptimizations) {
+                auto *unaryExpr = static_cast<UnaryExpression *>(expr);
+                return isSimpleExpr(unaryExpr->operand.get()) && !exprHasCallRecursive(unaryExpr);
+            }
+            return false;
+        default:
+            return false;
     }
 }
 
@@ -1436,12 +1551,26 @@ void CodeGenerator::generateBinaryExpression(BinaryExpression *expr)
         }
         else
         {
-            generateExpression(expr->right.get());
-            emit("addi sp, sp, -4");
-            emit("sw a0, 0(sp)");
-            generateExpression(expr->left.get());
-            emit("lw a1, 0(sp)");
-            emit("addi sp, sp, 4");
+            // 优化：如果右侧不包含函数调用，可以使用寄存器缓存避免栈操作
+            if (enableOptimizations && !exprHasCallRecursive(expr->right.get()))
+            {
+                generateExpression(expr->right.get());
+                emit("addi t0, a0, 0");  // 保存右值到t0
+                generateExpression(expr->left.get());
+                emit("addi a1, t0, 0");  // 从t0恢复右值到a1
+                // 无效化t0缓存，因为它被临时使用了
+                t0Cache.clear();
+            }
+            else
+            {
+                // 保守栈路径：仅在有函数调用时使用
+                generateExpression(expr->right.get());
+                emit("addi sp, sp, -4");
+                emit("sw a0, 0(sp)");
+                generateExpression(expr->left.get());
+                emit("lw a1, 0(sp)");
+                emit("addi sp, sp, 4");
+            }
         }
 
         switch (expr->op)
