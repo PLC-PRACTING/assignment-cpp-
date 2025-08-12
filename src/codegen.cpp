@@ -547,17 +547,13 @@ void CodeGenerator::generateWhileStatement(WhileStatement *stmt)
     invariantReuseEnabled = false;
     invariantComputeBypass = false;
 
-            // 保守的循环条件优化
-        if (enableOptimizations && stmt->condition.get() && canOptimizeLoopCondition(stmt->condition.get()))
-        {
-            generateOptimizedLoopCondition(stmt->condition.get(), endLabel);
-        }
-        else if (stmt->condition.get())
-        {
-            // 普通条件处理
-            generateExpression(stmt->condition.get());
-            emit("beqz a0, " + getLabelName(endLabel));
-        }
+    // 暂时禁用循环条件优化，确保正确性
+    if (stmt->condition.get())
+    {
+        // 普通条件处理
+        generateExpression(stmt->condition.get());
+        emit("beqz a0, " + getLabelName(endLabel));
+    }
 
     // Generate body
     isUnreachable = false; // Body is reachable from the condition
@@ -671,14 +667,14 @@ void CodeGenerator::generateExpression(Expression *expr)
         return;
     }
 
-        // 暂时禁用常量表达式优化，避免段错误
+    // 暂时禁用常量表达式优化，避免段错误
     // if (enableOptimizations && expr && isConstantExpression(expr))
     // {
     //     int value = evaluateConstantExpression(expr);
     //     emit("li a0, " + std::to_string(value));
     //     return;
     // }
-    
+
     // 暂时禁用CSE，避免段错误
     // if (enableOptimizations && expr)
     // {
@@ -1425,96 +1421,13 @@ void CodeGenerator::generateBinaryExpression(BinaryExpression *expr)
             }
         }
 
-        // 优化策略：减少栈操作，提升寄存器利用率
-        // - 若左右都是简单表达式：直接装入寄存器，无需栈
-        // - 若两侧都不包含调用：优先使用寄存器中转，避免入栈/出栈
-        // - 若右简单左复杂：先求左入a0，再加载右到a1
-        // - 若左简单右复杂：先求右入栈，再加载左到a0，最后出栈到a1
-        bool leftSimple = isSimpleExpr(expr->left.get());
-        bool rightSimple = isSimpleExpr(expr->right.get());
-
-        if (leftSimple && rightSimple)
-        {
-            tryLoadSimpleExprTo(expr->left.get(), "a0");
-            tryLoadSimpleExprTo(expr->right.get(), "a1");
-            // 变量相同的特例：进一步规约
-            if (expr->left->type == NodeType::VARIABLE_EXPR &&
-                expr->right->type == NodeType::VARIABLE_EXPR)
-            {
-                auto *lv = static_cast<VariableExpression *>(expr->left.get());
-                auto *rv = static_cast<VariableExpression *>(expr->right.get());
-                int loff = getVariableOffset(lv->name);
-                int roff = getVariableOffset(rv->name);
-                if (loff == roff)
-                {
-                    switch (expr->op)
-                    {
-                    case BinaryOp::ADD:
-                        // x + x => slli x,1
-                        emit("slli a0, a0, 1");
-                        return;
-                    case BinaryOp::SUB:
-                        emit("li a0, 0");
-                        return;
-                    case BinaryOp::EQ:
-                        emit("li a0, 1");
-                        return;
-                    case BinaryOp::NE:
-                        emit("li a0, 0");
-                        return;
-                    case BinaryOp::LT:
-                        emit("li a0, 0");
-                        return;
-                    case BinaryOp::LE:
-                        emit("li a0, 1");
-                        return;
-                    case BinaryOp::GT:
-                        emit("li a0, 0");
-                        return;
-                    case BinaryOp::GE:
-                        emit("li a0, 1");
-                        return;
-                    default:
-                        break;
-                    }
-                }
-            }
-        }
-        // 注意：不要在此使用寄存器保存右值以避免被左侧求值过程覆写（左侧生成可能会使用 a1）。
-        // 保守栈路径
-        else if (!leftSimple && rightSimple)
-        {
-            generateExpression(expr->left.get()); // a0
-            tryLoadSimpleExprTo(expr->right.get(), "a1");
-        }
-        else if (leftSimple && !rightSimple)
-        {
-            // 右侧复杂：先计算右值到 a0，再将其移动到 a1，避免入栈/出栈开销
-            generateExpression(expr->right.get());
-            emit("mv a1, a0"); // 使用mv指令更高效
-            tryLoadSimpleExprTo(expr->left.get(), "a0");
-            // 更新 a1 缓存状态
-            if (expr->right.get() && expr->right.get()->type == NodeType::VARIABLE_EXPR)
-            {
-                auto *varExpr = static_cast<VariableExpression *>(expr->right.get());
-                a1HoldsVariable = true;
-                a1HeldVarOffset = getVariableOffset(varExpr->name);
-            }
-            else
-            {
-                a1HoldsVariable = false;
-            }
-        }
-        else
-        {
-            // 使用标准栈方法，确保正确性
-            generateExpression(expr->right.get());
-            emit("addi sp, sp, -4");
-            emit("sw a0, 0(sp)");
-            generateExpression(expr->left.get());
-            emit("lw a1, 0(sp)");
-            emit("addi sp, sp, 4");
-        }
+        // 使用标准栈方法，确保正确性
+        generateExpression(expr->right.get());
+        emit("addi sp, sp, -4");
+        emit("sw a0, 0(sp)");
+        generateExpression(expr->left.get());
+        emit("lw a1, 0(sp)");
+        emit("addi sp, sp, 4");
 
         switch (expr->op)
         {
@@ -2070,8 +1983,6 @@ void CodeGenerator::generateVariableExpression(VariableExpression *expr)
     // TODO: 需要更精确的活跃性分析
 
     emit("lw a0, " + std::to_string(offset) + "(fp)");
-    a0HoldsVariable = true;
-    a0HeldVarOffset = offset;
 }
 
 void CodeGenerator::generateCallExpression(CallExpression *expr)
@@ -2085,123 +1996,7 @@ void CodeGenerator::generateCallExpression(CallExpression *expr)
         return;
     }
 
-    // 扩展的参数优化：支持更多参数和更智能的处理
-    if (argCount <= 3 && enableOptimizations)
-    {
-        bool canDirectLoad = true;
-        bool hasConstantArgs = false;
-
-        // 检查参数复杂度和常量情况
-        for (auto &a : expr->arguments)
-        {
-            if (expressionContainsCall(a.get()))
-            {
-                canDirectLoad = false;
-                break;
-            }
-            if (isConstantExpression(a.get()))
-            {
-                hasConstantArgs = true;
-            }
-            else if (!isSimpleExpr(a.get()))
-            {
-                canDirectLoad = false;
-                break;
-            }
-        }
-
-        if (canDirectLoad)
-        {
-            // 对常量参数进行特殊优化
-            if (hasConstantArgs)
-            {
-                for (size_t i = 0; i < argCount; i++)
-                {
-                    if (isConstantExpression(expr->arguments[i].get()))
-                    {
-                        int value = evaluateConstantExpression(expr->arguments[i].get());
-                        emit("li a" + std::to_string(i) + ", " + std::to_string(value));
-                    }
-                    else
-                    {
-                        generateExpression(expr->arguments[i].get());
-                        if (i > 0)
-                            emit("mv a" + std::to_string(i) + ", a0");
-                    }
-                }
-            }
-            else
-            {
-                // 普通的直接加载
-                if (argCount == 1)
-                {
-                    generateExpression(expr->arguments[0].get());
-                }
-                else
-                {
-                    // 从后往前生成，避免覆盖
-                    for (int i = argCount - 1; i >= 0; i--)
-                    {
-                        generateExpression(expr->arguments[i].get());
-                        if (i > 0)
-                            emit("mv a" + std::to_string(i) + ", a0");
-                    }
-                }
-            }
-            emit("call " + expr->functionName);
-            return;
-        }
-    }
-
-    // 快路径：所有实参均为简单表达式且不包含调用，优化处理
-    bool allSimple = true;
-    for (auto &a : expr->arguments)
-    {
-        if (!isSimpleExpr(a.get()) || exprHasCallRecursive(a.get()))
-        {
-            allSimple = false;
-            break;
-        }
-    }
-    if (allSimple && enableOptimizations)
-    {
-        int extraArgs = static_cast<int>(argCount > 8 ? argCount - 8 : 0);
-        if (extraArgs > 0)
-        {
-            // 超过8个参数才需要栈
-            int spillAreaBytes = extraArgs * 4;
-            int alignedBytes = (spillAreaBytes + 15) & ~15;
-            emit("addi sp, sp, -" + std::to_string(alignedBytes));
-
-            // 先加载前8个到寄存器
-            for (size_t i = 0; i < 8; i++)
-            {
-                tryLoadSimpleExprTo(expr->arguments[i].get(), ("a" + std::to_string(i)).c_str());
-            }
-            // 然后处理溢出参数
-            for (size_t i = 8; i < argCount; i++)
-            {
-                tryLoadSimpleExprTo(expr->arguments[i].get(), "t0");
-                int dst = static_cast<int>(i - 8) * 4;
-                emit("sw t0, " + std::to_string(dst) + "(sp)");
-            }
-            emit("call " + expr->functionName);
-            emit("addi sp, sp, " + std::to_string(alignedBytes));
-        }
-        else
-        {
-            // 8个或更少参数，直接加载到寄存器，无需栈操作
-            for (size_t i = 0; i < argCount; i++)
-            {
-                tryLoadSimpleExprTo(expr->arguments[i].get(), ("a" + std::to_string(i)).c_str());
-            }
-            emit("call " + expr->functionName);
-        }
-        return;
-    }
-
-    // 保守策略：为避免嵌套调用破坏，使用临时区缓存所有参数再搬运
-
+    // 保守策略：使用标准栈方法处理所有参数
     int extraArgs = static_cast<int>(argCount > 8 ? argCount - 8 : 0);
     int spillAreaBytes = extraArgs * 4;                 // area visible to callee for args >8
     int tempAreaBytes = static_cast<int>(argCount) * 4; // store all evaluated args
