@@ -2,6 +2,7 @@
 #include "lexer.h"
 #include "parser.h"
 #include "semantic.h"
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <sstream>
@@ -32,6 +33,16 @@ int main(int argc, char *argv[])
         {
             throw std::runtime_error("No input provided");
         }
+
+        // Normalize line endings: convert CRLF to LF
+        size_t pos = 0;
+        while ((pos = source.find("\r\n", pos)) != std::string::npos)
+        {
+            source.replace(pos, 2, "\n");
+            pos += 1;
+        }
+        // Remove any remaining standalone CR characters
+        source.erase(std::remove(source.begin(), source.end(), '\r'), source.end());
 
         // Lexical analysis  
         Lexer lexer(source);  // string_view构造
