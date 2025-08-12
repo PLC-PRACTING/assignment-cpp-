@@ -13,6 +13,9 @@ class CodeGenerator
 {
   private:
     std::stringstream output;
+    
+    // 优化字符串操作的缓存区
+    std::string instructionBuffer;
     std::unordered_map<std::string, int> variables; // variable name -> stack offset
     std::unordered_map<std::string, FunctionDeclaration *> functions;
     int stackOffset;
@@ -39,25 +42,15 @@ class CodeGenerator
     std::set<std::string> usedVariables;
     bool enableOptimizations = true;
 
-    // 死代码消除
-    std::set<std::string> liveVariables;
-
-    // 常量传播
-    std::unordered_map<std::string, int> constantTable;
-
-    // 公共子表达式消除
-    std::unordered_map<std::string, std::string> exprCache; // 表达式 -> 临时变量
-
     // 基本块内保守寄存器复用：记录 a0/a1 当前是否保存了某个变量槽位的值
     bool a0HoldsVariable = false;
     int a0HeldVarOffset = 0;
     bool a1HoldsVariable = false;
     int a1HeldVarOffset = 0;
-
+    
     // 循环变量寄存器分配：t寄存器用于存储频繁访问的局部变量
     std::unordered_map<std::string, std::string> loopVarRegMap; // 变量名 -> 寄存器名
     bool inLoopContext = false;
-    int loopNestingLevel = 0; // 循环嵌套深度
 
     // 循环不变式提取 + 简易 CSE（基于表达式串的保守复用）
     bool invariantReuseEnabled = false;
@@ -65,6 +58,7 @@ class CodeGenerator
     std::unordered_map<std::string, int> invariantExprToOffset;
 
     void emit(const std::string &instruction);
+    void emitFast(const char* instruction);  // 优化版本，避免string创建
     void emitLabel(const std::string &label);
     int nextLabel();
     std::string getLabelName(int labelId);
@@ -102,17 +96,6 @@ class CodeGenerator
 
     void generateShortCircuitAnd(BinaryExpression *expr);
     void generateShortCircuitOr(BinaryExpression *expr);
-
-    // 循环优化相关
-    bool canOptimizeLoopCondition(Expression *cond);
-    void generateOptimizedLoopCondition(Expression *cond, int endLabel);
-
-    // 高级优化
-    void performDeadCodeElimination(BlockStatement *block);
-    void performConstantPropagation(BlockStatement *block);
-    std::string generateCSE(Expression *expr);
-    bool isConstantExpression(Expression *expr);
-    int evaluateConstantExpression(Expression *expr);
 
     std::optional<int> tryConstantFolding(Expression *expr);
     std::optional<int> getPowerOfTwoShift(Expression *expr);

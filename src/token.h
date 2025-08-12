@@ -63,6 +63,16 @@ struct Token {
     Token(TokenType t = TokenType::INVALID, const std::string& v = "", 
           size_t l = 0, size_t c = 0) 
         : type(t), value(v), line(l), column(c) {}
+        
+    // 支持移动语义
+    Token(TokenType t, std::string&& v, size_t l = 0, size_t c = 0)
+        : type(t), value(std::move(v)), line(l), column(c) {}
+        
+    // 默认移动构造函数和赋值操作符
+    Token(Token&&) = default;
+    Token& operator=(Token&&) = default;
+    Token(const Token&) = default;
+    Token& operator=(const Token&) = default;
 };
 
 class TokenUtils {

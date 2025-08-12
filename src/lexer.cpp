@@ -2,7 +2,7 @@
 #include <cctype>
 #include <stdexcept>
 
-Lexer::Lexer(const std::string &source) : source(source), current(0), line(1), column(1) {}
+Lexer::Lexer(std::string_view source) : source(source), current(0), line(1), column(1) {}
 
 bool Lexer::isEnd() const
 {
@@ -81,12 +81,12 @@ Token Lexer::makeNumber()
 {
     size_t start_line = line;
     size_t start_column = column;
-    std::string value;
-
+    size_t start_pos = current;
+    
     // Handle zero
     if (peek() == '0')
     {
-        value += advance();
+        advance();
         if (std::isdigit(peek()))
         {
             throw std::runtime_error("Invalid number format: leading zeros not allowed");
@@ -97,35 +97,39 @@ Token Lexer::makeNumber()
         // Handle non-zero numbers
         while (!isEnd() && std::isdigit(peek()))
         {
-            value += advance();
+            advance();
         }
     }
-
-    return Token(TokenType::NUMBER, value, start_line, start_column);
+    
+    // 使用substr的string_view版本避免字符拷贝
+    std::string value(source.substr(start_pos, current - start_pos));
+    return Token(TokenType::NUMBER, std::move(value), start_line, start_column);
 }
 
 Token Lexer::makeIdentifier()
 {
     size_t start_line = line;
     size_t start_column = column;
-    std::string value;
+    size_t start_pos = current;
 
     // First character: letter or underscore
     if (std::isalpha(peek()) || peek() == '_')
     {
-        value += advance();
+        advance();
     }
 
     // Subsequent characters: letter, digit, or underscore
     while (!isEnd() && (std::isalnum(peek()) || peek() == '_'))
     {
-        value += advance();
+        advance();
     }
-
+    
+    // 使用substr避免逐个字符拷贝
+    std::string value(source.substr(start_pos, current - start_pos));
     TokenType type =
         TokenUtils::isKeyword(value) ? TokenUtils::getKeywordType(value) : TokenType::IDENTIFIER;
 
-    return Token(type, value, start_line, start_column);
+    return Token(type, std::move(value), start_line, start_column);
 }
 
 Token Lexer::makeOperator(char c)
@@ -261,12 +265,14 @@ Token Lexer::nextToken()
 std::vector<Token> Lexer::tokenize()
 {
     std::vector<Token> tokens;
+    // 预留空间减少内存分配次数
+    tokens.reserve(source.size() / 4); // 估计token数量
     Token token;
 
     do
     {
         token = nextToken();
-        tokens.push_back(token);
+        tokens.emplace_back(std::move(token));  // 使用move语义
     } while (token.type != TokenType::END_OF_FILE);
 
     return tokens;

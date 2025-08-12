@@ -34,12 +34,19 @@ private:
     DataType currentFunctionReturnType;
     std::string currentFunctionName;
     
+    // 缓存最近查找的变量信息以提高性能
+    mutable std::unordered_map<std::string, const VariableInfo*> variableCache;
+    
     void enterScope();
     void exitScope();
     void declareVariable(const std::string& name, DataType type);
     void checkVariableExists(const std::string& name);
     void checkFunctionExists(const std::string& name);
     void checkTypeCompatibility(DataType expected, DataType actual, const std::string& context);
+    
+    // 优化的变量查找方法
+    const VariableInfo* findVariable(const std::string& name) const;
+    void invalidateVariableCache();
     
     void analyzeProgram(Program* program);
     void analyzeFunctionDeclaration(FunctionDeclaration* func);

@@ -9,6 +9,14 @@ class ASTNode;
 class Expression;
 class Statement;
 class Declaration;
+class ASTVisitor;
+
+// 访问者模式基类的前向声明
+class BinaryExpression;
+class UnaryExpression;
+class LiteralExpression;
+class VariableExpression;
+class CallExpression;
 
 using ASTNodePtr = std::unique_ptr<ASTNode>;
 using ExpressionPtr = std::unique_ptr<Expression>;
@@ -76,7 +84,7 @@ protected:
 
 class BinaryExpression : public Expression {
 public:
-    BinaryOp op;
+    BinaryOp op;  // 把小的数据放在前面优化内存布局
     ExpressionPtr left;
     ExpressionPtr right;
     

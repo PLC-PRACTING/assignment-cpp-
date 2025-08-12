@@ -33,8 +33,8 @@ int main(int argc, char *argv[])
             throw std::runtime_error("No input provided");
         }
 
-        // Lexical analysis
-        Lexer lexer(source);
+        // Lexical analysis  
+        Lexer lexer(source);  // string_view构造
         std::vector<Token> tokens = lexer.tokenize();
 
         // Optional debug: dump tokens when TOYC_DUMP_TOKENS=1

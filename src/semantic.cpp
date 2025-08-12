@@ -11,12 +11,14 @@ SemanticAnalyzer::SemanticAnalyzer()
 void SemanticAnalyzer::enterScope() {
     currentScopeLevel++;
     scopes.emplace_back();
+    invalidateVariableCache();
 }
 
 void SemanticAnalyzer::exitScope() {
     if (currentScopeLevel > 0) {
         currentScopeLevel--;
         scopes.pop_back();
+        invalidateVariableCache();
     }
 }
 
@@ -28,17 +30,13 @@ void SemanticAnalyzer::declareVariable(const std::string& name, DataType type) {
     }
     
     currentScope[name] = VariableInfo(type, true, currentScopeLevel);
+    invalidateVariableCache();  // 新声明的变量可能影响缓存
 }
 
 void SemanticAnalyzer::checkVariableExists(const std::string& name) {
-    // Search from innermost to outermost scope
-    for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
-        if (it->find(name) != it->end()) {
-            return; // Variable found
-        }
+    if (findVariable(name) == nullptr) {
+        throw std::runtime_error("Undefined variable '" + name + "'");
     }
-    
-    throw std::runtime_error("Undefined variable '" + name + "'");
 }
 
 void SemanticAnalyzer::checkFunctionExists(const std::string& name) {
@@ -55,6 +53,31 @@ void SemanticAnalyzer::checkTypeCompatibility(DataType expected, DataType actual
         ss << ", got " << (actual == DataType::INT ? "int" : "void");
         throw std::runtime_error(ss.str());
     }
+}
+
+// 新增的优化方法
+const VariableInfo* SemanticAnalyzer::findVariable(const std::string& name) const {
+    // 先检查缓存
+    auto cacheIt = variableCache.find(name);
+    if (cacheIt != variableCache.end()) {
+        return cacheIt->second;
+    }
+    
+    // 从内层到外层搜索作用域
+    for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
+        auto varIt = it->find(name);
+        if (varIt != it->end()) {
+            // 缓存结果
+            variableCache[name] = &varIt->second;
+            return &varIt->second;
+        }
+    }
+    
+    return nullptr;
+}
+
+void SemanticAnalyzer::invalidateVariableCache() {
+    variableCache.clear();
 }
 
 void SemanticAnalyzer::analyze(Program* program) {

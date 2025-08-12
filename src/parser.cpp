@@ -8,17 +8,23 @@ bool Parser::isEnd() const {
     return current >= tokens.size() || tokens[current].type == TokenType::END_OF_FILE;
 }
 
-Token Parser::peek() const {
-    if (current >= tokens.size()) return Token(TokenType::END_OF_FILE);
+const Token& Parser::peek() const {
+    if (current >= tokens.size()) {
+        static const Token eofToken(TokenType::END_OF_FILE);  // 缓存静态EOF token
+        return eofToken;
+    }
     return tokens[current];
 }
 
-Token Parser::peekNext() const {
-    if (current + 1 >= tokens.size()) return Token(TokenType::END_OF_FILE);
+const Token& Parser::peekNext() const {
+    if (current + 1 >= tokens.size()) {
+        static const Token eofToken(TokenType::END_OF_FILE);
+        return eofToken;
+    }
     return tokens[current + 1];
 }
 
-Token Parser::advance() {
+const Token& Parser::advance() {
     if (!isEnd()) current++;
     return tokens[current - 1];
 }
@@ -36,7 +42,7 @@ bool Parser::check(TokenType type) const {
     return peek().type == type;
 }
 
-Token Parser::consume(TokenType type, const std::string& message) {
+const Token& Parser::consume(TokenType type, const std::string& message) {
     if (check(type)) return advance();
     
     std::stringstream ss;
@@ -67,8 +73,8 @@ std::unique_ptr<Program> Parser::parseProgram() {
 std::unique_ptr<FunctionDeclaration> Parser::parseFunctionDeclaration() {
     DataType returnType = parseType();
     
-    Token nameToken = consume(TokenType::IDENTIFIER, "Expected function name");
-    std::string name = nameToken.value;
+    const Token& nameToken = consume(TokenType::IDENTIFIER, "Expected function name");
+    std::string name = nameToken.value;  // 只在需要时拷贝
     
     consume(TokenType::LEFT_PAREN, "Expected '(' after function name");
     std::vector<Parameter> parameters = parseParameters();
@@ -85,7 +91,7 @@ std::vector<Parameter> Parser::parseParameters() {
     if (!check(TokenType::RIGHT_PAREN)) {
         do {
             DataType type = parseType();
-            Token nameToken = consume(TokenType::IDENTIFIER, "Expected parameter name");
+            const Token& nameToken = consume(TokenType::IDENTIFIER, "Expected parameter name");
             parameters.emplace_back(nameToken.value, type);
         } while (match(TokenType::COMMA));
     }
@@ -196,7 +202,7 @@ StatementPtr Parser::parseContinueStatement() {
 StatementPtr Parser::parseAssignOrVarDeclStatement() {
     if (match(TokenType::INT)) {
         // Variable declaration
-        Token nameToken = consume(TokenType::IDENTIFIER, "Expected variable name");
+        const Token& nameToken = consume(TokenType::IDENTIFIER, "Expected variable name");
         consume(TokenType::ASSIGN, "Expected '=' in variable declaration");
         ExpressionPtr init = parseExpression();
         consume(TokenType::SEMICOLON, "Expected ';' after variable declaration");
@@ -204,7 +210,7 @@ StatementPtr Parser::parseAssignOrVarDeclStatement() {
         return std::make_unique<VarDeclStatement>(nameToken.value, std::move(init));
     } else {
         // Assignment
-        Token nameToken = consume(TokenType::IDENTIFIER, "Expected variable name");
+        const Token& nameToken = consume(TokenType::IDENTIFIER, "Expected variable name");
         consume(TokenType::ASSIGN, "Expected '='");
         ExpressionPtr expr = parseExpression();
         consume(TokenType::SEMICOLON, "Expected ';' after assignment");

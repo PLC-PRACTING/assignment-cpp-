@@ -11,12 +11,12 @@ private:
     size_t current;
     
     bool isEnd() const;
-    Token peek() const;
-    Token peekNext() const;
-    Token advance();
+    const Token& peek() const;  // 返回引用避免拷贝
+    const Token& peekNext() const;
+    const Token& advance();
     bool match(TokenType type);
     bool check(TokenType type) const;
-    Token consume(TokenType type, const std::string& message);
+    const Token& consume(TokenType type, const std::string& message);
     
     // Parsing methods
     std::unique_ptr<Program> parseProgram();

@@ -3,10 +3,11 @@
 #include "token.h"
 #include <vector>
 #include <string>
+#include <string_view>
 
 class Lexer {
 private:
-    std::string source;
+    std::string_view source;  // 使用string_view避免拷贝
     size_t current;
     size_t line;
     size_t column;
@@ -22,7 +23,7 @@ private:
     Token makeOperator(char c);
     
 public:
-    explicit Lexer(const std::string& source);
+    explicit Lexer(std::string_view source);  // 接受string_view
     std::vector<Token> tokenize();
     Token nextToken();
 };
