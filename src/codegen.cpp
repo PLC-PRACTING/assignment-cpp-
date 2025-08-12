@@ -63,11 +63,6 @@ void CodeGenerator::invalidateA0Cache()
 {
     a0HoldsVariable = false;
     a1HoldsVariable = false;
-    // 清理循环变量映射，避免复杂场景下的错误
-    if (enableOptimizations)
-    {
-        loopVarRegMap.clear();
-    }
 }
 
 // 将表达式序列化为一个可比较的字符串（保守、忽略临时标签）
@@ -195,7 +190,7 @@ void CodeGenerator::generateFunctionPrologue(const std::string &funcName, int lo
 
     // Calculate stack space needed with larger buffer for complex cases
     // Local variables + saved registers; 对齐到 16 字节即可
-    int frameSize = localVarCount * 4;   // ra, fp, and local variables already counted
+    int frameSize = (localVarCount + 2) * 4;   // ra, fp, and local variables
     int maxStackSize = (frameSize + 15) & ~15; // Align to 16 bytes
 
     currentStackSize = maxStackSize;
@@ -293,77 +288,6 @@ void CodeGenerator::generateFunction(FunctionDeclaration *func)
     // Count local variables for stack allocation (including nested blocks)
     int localVarCount = countLocalVariables(func->body.get());
 
-    // 参数使用性扫描（极简遍历，仅用于决定是否需要为参数分配槽并保存）
-    std::function<bool(Expression *, const std::string &)> exprUsesVar =
-        [&](Expression *e, const std::string &name) -> bool {
-        if (!e)
-            return false;
-        switch (e->type)
-        {
-        case NodeType::VARIABLE_EXPR:
-            return static_cast<VariableExpression *>(e)->name == name;
-        case NodeType::UNARY_EXPR:
-            return exprUsesVar(static_cast<UnaryExpression *>(e)->operand.get(), name);
-        case NodeType::BINARY_EXPR: {
-            auto *b = static_cast<BinaryExpression *>(e);
-            return exprUsesVar(b->left.get(), name) || exprUsesVar(b->right.get(), name);
-        }
-        case NodeType::CALL_EXPR: {
-            auto *c = static_cast<CallExpression *>(e);
-            for (auto &a : c->arguments)
-                if (exprUsesVar(a.get(), name))
-                    return true;
-            return false;
-        }
-        default:
-            return false;
-        }
-    };
-    std::function<bool(Statement *, const std::string &)> stmtUsesVar =
-        [&](Statement *s, const std::string &name) -> bool {
-        if (!s)
-            return false;
-        switch (s->type)
-        {
-        case NodeType::EXPR_STMT:
-            return exprUsesVar(static_cast<ExpressionStatement *>(s)->expression.get(), name);
-        case NodeType::ASSIGN_STMT: {
-            auto *a = static_cast<AssignStatement *>(s);
-            if (a->variable == name)
-                return true;
-            return exprUsesVar(a->expression.get(), name);
-        }
-        case NodeType::VAR_DECL_STMT: {
-            auto *v = static_cast<VarDeclStatement *>(s);
-            return exprUsesVar(v->initializer.get(), name);
-        }
-        case NodeType::RETURN_STMT:
-            return exprUsesVar(static_cast<ReturnStatement *>(s)->expression.get(), name);
-        case NodeType::IF_STMT: {
-            auto *i = static_cast<IfStatement *>(s);
-            if (exprUsesVar(i->condition.get(), name))
-                return true;
-            if (stmtUsesVar(i->thenStmt.get(), name))
-                return true;
-            return stmtUsesVar(i->elseStmt.get(), name);
-        }
-        case NodeType::WHILE_STMT: {
-            auto *w = static_cast<WhileStatement *>(s);
-            if (exprUsesVar(w->condition.get(), name))
-                return true;
-            return stmtUsesVar(w->body.get(), name);
-        }
-        case NodeType::BLOCK_STMT: {
-            auto *b = static_cast<BlockStatement *>(s);
-            for (auto &ss : b->statements)
-                if (stmtUsesVar(ss.get(), name))
-                    return true;
-            return false;
-        }
-        default:
-            return false;
-        }
-    };
 
     // Calculate proper stack layout
     int paramCount = static_cast<int>(func->parameters.size());
@@ -383,10 +307,9 @@ void CodeGenerator::generateFunction(FunctionDeclaration *func)
     // Initialize stack offset for local variables
     stackOffset = localOffset;
 
-    // 生成标准序言（经过验证更稳健）
     generateFunctionPrologue(func->name, totalLocals);
 
-    // Store parameters from registers to stack（对前 8 个形参全部保存，确保槽位可用）
+    // Store parameters from registers to stack
     for (size_t i = 0; i < func->parameters.size() && i < 8; i++)
     {
         int offset = getVariableOffset(func->parameters[i].name);
@@ -400,10 +323,7 @@ void CodeGenerator::generateFunction(FunctionDeclaration *func)
         for (size_t i = 8; i < func->parameters.size(); i++)
         {
             int destOffset = getVariableOffset(func->parameters[i].name); // negative in our frame
-            // RISC-V calling convention: stack args are above the callee's fp
-            // The layout from bottom to top is: [caller frame][arg8][arg9]...[saved ra][saved fp <- fp points here]
-            // So args are at positive offsets from fp
-            int srcOffset = static_cast<int>((i - 8) * 4); // offset above fp for stack arguments
+            int srcOffset = static_cast<int>((i - 8) * 4); // positive from fp (caller frame)
             emit("lw a0, " + std::to_string(srcOffset) + "(fp)");
             emit("sw a0, " + std::to_string(destOffset) + "(fp)");
         }
@@ -510,10 +430,7 @@ void CodeGenerator::generateIfStatement(IfStatement *stmt)
 
     if (stmt->elseStmt)
     {
-        if (!thenIsUnreachable)
-        {
-            emit("j " + getLabelName(endLabel));
-        }
+        emit("j " + getLabelName(endLabel));
         emitLabel(getLabelName(elseLabel));
 
         isUnreachable = false; // Reset for else branch
@@ -1856,28 +1773,12 @@ void CodeGenerator::generateLiteralExpression(LiteralExpression *expr)
 void CodeGenerator::generateVariableExpression(VariableExpression *expr)
 {
     int offset = getVariableOffset(expr->name);
-
-    // 暂时禁用循环变量寄存器分配，避免复杂场景下的问题
-    // TODO: 重新实现更安全的循环变量优化
-
-    // 改进的寄存器复用：检查 a0 和 a1 是否已加载了该变量
-    if (enableOptimizations)
+    // 保守寄存器复用：若 a0 已经持有同一槽位的值且中间无调用/破坏，则无需再次 lw
+    if (a0HoldsVariable && a0HeldVarOffset == offset)
     {
-        if (a0HoldsVariable && a0HeldVarOffset == offset)
-        {
-            return; // a0 中已有当前变量的值
-        }
-        if (a1HoldsVariable && a1HeldVarOffset == offset)
-        {
-            emitFast("addi a0, a1, 0"); // 从 a1 复制到 a0，比 lw 更快
-            a0HoldsVariable = true;
-            a0HeldVarOffset = offset;
-            return;
-        }
+        return;
     }
-
-    instructionBuffer = "lw a0, " + std::to_string(offset) + "(fp)";
-    emit(instructionBuffer);
+    emit("lw a0, " + std::to_string(offset) + "(fp)");
     a0HoldsVariable = true;
     a0HeldVarOffset = offset;
 }
@@ -1893,45 +1794,6 @@ void CodeGenerator::generateCallExpression(CallExpression *expr)
         return;
     }
 
-    // 扩展优化：对1-3个简单参数进行直接装载优化
-    if (argCount <= 3 && enableOptimizations)
-    {
-        bool canDirectLoad = true;
-        for (auto &a : expr->arguments)
-        {
-            if (!isSimpleExpr(a.get()) || expressionContainsCall(a.get()))
-            {
-                canDirectLoad = false;
-                break;
-            }
-        }
-
-        if (canDirectLoad)
-        {
-            // 扩展的优化：对1-3个参数使用直接装载
-            if (argCount == 1)
-            {
-                generateExpression(expr->arguments[0].get()); // 直接到 a0
-            }
-            else if (argCount == 2)
-            {
-                generateExpression(expr->arguments[1].get()); // 先生成第二个到 a0
-                emit("addi a1, a0, 0");                       // 移动到 a1
-                generateExpression(expr->arguments[0].get()); // 再生成第一个到 a0
-            }
-            else if (argCount == 3)
-            {
-                // 3个参数：从后往前生成，避免覆盖
-                generateExpression(expr->arguments[2].get()); // 先生成第三个到 a0
-                emit("addi a2, a0, 0");                       // 移动到 a2
-                generateExpression(expr->arguments[1].get()); // 再生成第二个到 a0
-                emit("addi a1, a0, 0");                       // 移动到 a1
-                generateExpression(expr->arguments[0].get()); // 最后生成第一个到 a0
-            }
-            emit("call " + expr->functionName);
-            return;
-        }
-    }
 
     // 快路径：所有实参均为简单表达式且不包含调用，直接填充寄存器和溢出区
     bool allSimple = true;
