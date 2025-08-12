@@ -39,9 +39,26 @@ class CodeGenerator
     std::set<std::string> usedVariables;
     bool enableOptimizations = true;
 
-    // 基本块内保守寄存器复用：记录 a0/a1 当前是否保存了某个变量槽位的值
-    bool a0HoldsVariable = false;
-    int a0HeldVarOffset = 0;
+    // 基本块内保守寄存器复用：记录寄存器当前是否保存了某个变量槽位的值
+    struct RegisterCache {
+        bool holdsVariable = false;
+        int heldVarOffset = 0;
+        std::string regName;
+        
+        void clear() {
+            holdsVariable = false;
+            heldVarOffset = 0;
+        }
+    };
+    
+    RegisterCache a0Cache = {false, 0, "a0"};
+    RegisterCache t0Cache = {false, 0, "t0"};
+    RegisterCache t1Cache = {false, 0, "t1"};
+    RegisterCache t2Cache = {false, 0, "t2"};
+    
+    // 保持向后兼容的别名
+    bool& a0HoldsVariable = a0Cache.holdsVariable;
+    int& a0HeldVarOffset = a0Cache.heldVarOffset;
     bool a1HoldsVariable = false;
     int a1HeldVarOffset = 0;
     
@@ -60,6 +77,9 @@ class CodeGenerator
     std::string getLabelName(int labelId);
 
     void invalidateA0Cache();
+    void invalidateAllCaches();
+    RegisterCache* findCachedVariable(int offset);
+    RegisterCache* findAvailableRegister();
 
     // 分析/序列化工具
     std::string serializeExpr(Expression *expr);
