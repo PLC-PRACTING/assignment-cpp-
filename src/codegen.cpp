@@ -2,7 +2,6 @@
 #include <algorithm>
 #include <cmath> // For log2
 #include <cstring> // For strncmp
-#include <functional>
 #include <sstream>
 #include <stdexcept>
 
@@ -461,10 +460,11 @@ void CodeGenerator::generateWhileStatement(WhileStatement *stmt)
     inLoopContext = true;
     std::unordered_map<std::string, std::string> oldLoopVarRegMap = loopVarRegMap;
     
-    if (enableOptimizations) {
-        analyzeAndAllocateLoopRegisters(stmt);
-        hoistLoopInvariants(stmt);
-    }
+    // 禁用复杂循环优化，避免在嵌套循环中引入错误
+    // if (enableOptimizations) {
+    //     analyzeAndAllocateLoopRegisters(stmt);
+    //     hoistLoopInvariants(stmt);
+    // }
 
     emitLabel(getLabelName(startLabel));
 
@@ -487,19 +487,7 @@ void CodeGenerator::generateWhileStatement(WhileStatement *stmt)
 
     emitLabel(getLabelName(endLabel));
     
-    // 循环结束后将寄存器值写回内存
-    if (enableOptimizations) {
-        for (const auto& pair : loopVarRegMap) {
-            const std::string& var = pair.first;
-            const std::string& reg = pair.second;
-            try {
-                int offset = getVariableOffset(var);
-                emit("sw " + reg + ", " + std::to_string(offset) + "(fp)");
-            } catch (...) {
-                // 变量不存在，跳过
-            }
-        }
-    }
+    // 循环寄存器分配优化已被禁用，无需写回寄存器值
     
     // 恢复循环上下文
     inLoopContext = oldInLoopContext;
@@ -546,11 +534,7 @@ void CodeGenerator::generateAssignStatement(AssignStatement *stmt)
     int offset = getVariableOffset(stmt->variable);
     emit("sw a0, " + std::to_string(offset) + "(fp)");
     
-    // 循环中同时更新寄存器
-    if (inLoopContext && loopVarRegMap.count(stmt->variable)) {
-        const std::string& reg = loopVarRegMap[stmt->variable];
-        emit("addi " + reg + ", a0, 0"); // 将a0值复制到寄存器
-    }
+    // 循环寄存器分配优化已被禁用
 }
 
 void CodeGenerator::generateVarDeclStatement(VarDeclStatement *stmt)
@@ -933,11 +917,11 @@ void CodeGenerator::generateBinaryExpression(BinaryExpression *expr)
     }
     else
     {
-        // 数组索引计算优化
-        if (enableOptimizations && isArrayIndexPattern(expr)) {
-            optimizeArrayIndexComputation(expr);
-            return;
-        }
+        // 数组索引计算优化已被禁用，避免在复杂表达式中引入计算错误
+        // if (enableOptimizations && isArrayIndexPattern(expr)) {
+        //     optimizeArrayIndexComputation(expr);
+        //     return;
+        // }
         // Same-variable optimization: handle x op x cases
         // 检查是否为同变量表达式
         bool sameVariable = false;
@@ -1811,12 +1795,7 @@ void CodeGenerator::generateLiteralExpression(LiteralExpression *expr)
 
 void CodeGenerator::generateVariableExpression(VariableExpression *expr)
 {
-    // 循环中优先使用寄存器
-    if (inLoopContext && loopVarRegMap.count(expr->name)) {
-        const std::string& reg = loopVarRegMap[expr->name];
-        emit("addi a0, " + reg + ", 0"); // 将寄存器值复制到a0
-        return;
-    }
+    // 循环寄存器分配优化已被禁用
     
     int offset = getVariableOffset(expr->name);
     // 保守寄存器复用：若 a0 已经持有同一槽位的值且中间无调用/破坏，则无需再次 lw
@@ -1958,6 +1937,9 @@ bool CodeGenerator::canInlineFunction(FunctionDeclaration *func) {
 void CodeGenerator::generateInlinedCall(CallExpression *expr, FunctionDeclaration *func) {
     if (expr->functionName == "min" && expr->arguments.size() == 2) {
         // 内联 min(a, b): a < b ? a : b
+        int elseLabel = nextLabel();
+        int endLabel = nextLabel();
+        
         generateExpression(expr->arguments[0].get()); // a -> a0
         emit("addi sp, sp, -4");
         emit("sw a0, 0(sp)"); // 保存 a
@@ -1970,15 +1952,18 @@ void CodeGenerator::generateInlinedCall(CallExpression *expr, FunctionDeclaratio
         // a0 = a, a1 = b
         // if (a < b) return a; else return b;
         emit("slt t0, a0, a1"); // t0 = (a < b)
-        emit("beqz t0, .L_min_else_" + std::to_string(nextLabel()));
+        emit("beqz t0, " + getLabelName(elseLabel));
         // a < b，返回 a (已在 a0 中)
-        emit("j .L_min_end_" + std::to_string(labelCounter));
-        emitLabel(".L_min_else_" + std::to_string(labelCounter));
+        emit("j " + getLabelName(endLabel));
+        emitLabel(getLabelName(elseLabel));
         emit("addi a0, a1, 0"); // 返回 b
-        emitLabel(".L_min_end_" + std::to_string(labelCounter));
+        emitLabel(getLabelName(endLabel));
         
     } else if (expr->functionName == "max" && expr->arguments.size() == 2) {
         // 内联 max(a, b): a > b ? a : b
+        int elseLabel = nextLabel();
+        int endLabel = nextLabel();
+        
         generateExpression(expr->arguments[0].get()); // a -> a0
         emit("addi sp, sp, -4");
         emit("sw a0, 0(sp)"); // 保存 a
@@ -1991,42 +1976,20 @@ void CodeGenerator::generateInlinedCall(CallExpression *expr, FunctionDeclaratio
         // a0 = a, a1 = b
         // if (a > b) return a; else return b;
         emit("sgt t0, a0, a1"); // t0 = (a > b)
-        emit("beqz t0, .L_max_else_" + std::to_string(nextLabel()));
+        emit("beqz t0, " + getLabelName(elseLabel));
         // a > b，返回 a (已在 a0 中)
-        emit("j .L_max_end_" + std::to_string(labelCounter));
-        emitLabel(".L_max_else_" + std::to_string(labelCounter));
+        emit("j " + getLabelName(endLabel));
+        emitLabel(getLabelName(elseLabel));
         emit("addi a0, a1, 0"); // 返回 b
-        emitLabel(".L_max_end_" + std::to_string(labelCounter));
+        emitLabel(getLabelName(endLabel));
     }
 }
 
 // 分析并为循环变量分配寄存器
 void CodeGenerator::analyzeAndAllocateLoopRegisters(WhileStatement *stmt) {
-    if (!stmt || !stmt->body) return;
-    
-    // 收集循环中被修改的变量
-    std::unordered_set<std::string> loopVars;
-    collectLoopVariables(stmt->body.get(), loopVars);
-    
-    // 为最频繁访问的变量分配临时寄存器
-    // 简化策略：为循环计数器分配寄存器
-    std::vector<std::string> availableRegs = {"t1", "t2", "t3", "t4"};
-    int regIndex = 0;
-    
-    for (const auto& var : loopVars) {
-        if (regIndex < static_cast<int>(availableRegs.size())) {
-            loopVarRegMap[var] = availableRegs[regIndex];
-            // 在循环开始前加载变量到寄存器
-            try {
-                int offset = getVariableOffset(var);
-                emit("lw " + availableRegs[regIndex] + ", " + std::to_string(offset) + "(fp)");
-            } catch (...) {
-                // 如果变量不存在，跳过
-                continue;
-            }
-            regIndex++;
-        }
-    }
+    // 禁用循环寄存器分配优化，避免嵌套循环中的寄存器冲突
+    // 该优化在复杂嵌套循环中会导致寄存器错误分配，造成超时和错误结果
+    return;
 }
 
 // 收集循环中被修改的变量
