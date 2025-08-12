@@ -460,11 +460,10 @@ void CodeGenerator::generateWhileStatement(WhileStatement *stmt)
     inLoopContext = true;
     std::unordered_map<std::string, std::string> oldLoopVarRegMap = loopVarRegMap;
     
-    // 禁用复杂循环优化，避免在嵌套循环中引入错误
-    // if (enableOptimizations) {
-    //     analyzeAndAllocateLoopRegisters(stmt);
-    //     hoistLoopInvariants(stmt);
-    // }
+    // 启用安全的简单循环优化
+    if (enableOptimizations) {
+        allocateSimpleLoopRegisters(stmt);
+    }
 
     emitLabel(getLabelName(startLabel));
 
@@ -487,7 +486,13 @@ void CodeGenerator::generateWhileStatement(WhileStatement *stmt)
 
     emitLabel(getLabelName(endLabel));
     
-    // 循环寄存器分配优化已被禁用，无需写回寄存器值
+    // 在循环结束时将寄存器值写回到内存
+    for (const auto& pair : loopVarRegMap) {
+        const std::string& varName = pair.first;
+        const std::string& regName = pair.second;
+        int offset = getVariableOffset(varName);
+        emit("sw " + regName + ", " + std::to_string(offset) + "(fp)");
+    }
     
     // 恢复循环上下文
     inLoopContext = oldInLoopContext;
@@ -534,7 +539,11 @@ void CodeGenerator::generateAssignStatement(AssignStatement *stmt)
     int offset = getVariableOffset(stmt->variable);
     emit("sw a0, " + std::to_string(offset) + "(fp)");
     
-    // 循环寄存器分配优化已被禁用
+    // 如果变量有循环寄存器分配，同时更新寄存器
+    if (inLoopContext && loopVarRegMap.count(stmt->variable)) {
+        const std::string& regName = loopVarRegMap[stmt->variable];
+        emit("addi " + regName + ", a0, 0");  // 将a0值复制到循环寄存器
+    }
 }
 
 void CodeGenerator::generateVarDeclStatement(VarDeclStatement *stmt)
@@ -1306,6 +1315,14 @@ void CodeGenerator::generateBinaryExpression(BinaryExpression *expr)
             }
         }
 
+        // 优化常见的矩阵索引计算：(i * size + j) 模式
+        if (expr->op == BinaryOp::ADD && enableOptimizations) {
+            if (isMatrixIndexPattern(expr)) {
+                optimizeMatrixIndexCalculation(expr);
+                return;
+            }
+        }
+
         // 强度削弱优化：乘法转换为移位
         if (expr->op == BinaryOp::MUL)
         {
@@ -1321,6 +1338,11 @@ void CodeGenerator::generateBinaryExpression(BinaryExpression *expr)
                 generateExpression(expr->right.get());
                 instructionBuffer = "slli a0, a0, " + std::to_string(*shiftAmount);
                 emit(instructionBuffer);
+                return;
+            }
+            
+            // 优化小数乘法：如 x * 3 = x + x + x
+            if (optimizeSmallMultiplication(expr)) {
                 return;
             }
         }
@@ -1795,7 +1817,13 @@ void CodeGenerator::generateLiteralExpression(LiteralExpression *expr)
 
 void CodeGenerator::generateVariableExpression(VariableExpression *expr)
 {
-    // 循环寄存器分配优化已被禁用
+    // 检查是否有循环寄存器分配
+    if (inLoopContext && loopVarRegMap.count(expr->name)) {
+        const std::string& regName = loopVarRegMap[expr->name];
+        emit("addi a0, " + regName + ", 0");  // 将循环寄存器值复制到a0
+        a0HoldsVariable = false;  // 清除a0缓存状态
+        return;
+    }
     
     int offset = getVariableOffset(expr->name);
     // 保守寄存器复用：若 a0 已经持有同一槽位的值且中间无调用/破坏，则无需再次 lw
@@ -1914,9 +1942,14 @@ void CodeGenerator::generateCallExpression(CallExpression *expr)
 
 // 判断函数是否应该内联
 bool CodeGenerator::shouldInlineFunction(const std::string &functionName) {
-    // 内联常见的小型函数
+    // 内联常见的小型函数 - 扩展内联候选
     if (functionName == "min" || functionName == "max") {
         return true;
+    }
+    // 内联其他可能的简单函数
+    auto it = functions.find(functionName);
+    if (it != functions.end()) {
+        return canInlineFunction(it->second);
     }
     return false;
 }
@@ -1936,52 +1969,78 @@ bool CodeGenerator::canInlineFunction(FunctionDeclaration *func) {
 // 生成内联函数调用
 void CodeGenerator::generateInlinedCall(CallExpression *expr, FunctionDeclaration *func) {
     if (expr->functionName == "min" && expr->arguments.size() == 2) {
-        // 内联 min(a, b): a < b ? a : b
-        int elseLabel = nextLabel();
-        int endLabel = nextLabel();
+        // 优化内联 min(a, b): 更高效的实现
+        bool arg0Simple = isSimpleExpr(expr->arguments[0].get());
+        bool arg1Simple = isSimpleExpr(expr->arguments[1].get());
         
-        generateExpression(expr->arguments[0].get()); // a -> a0
-        emit("addi sp, sp, -4");
-        emit("sw a0, 0(sp)"); // 保存 a
-        
-        generateExpression(expr->arguments[1].get()); // b -> a0
-        emit("addi a1, a0, 0"); // b -> a1
-        emit("lw a0, 0(sp)"); // a -> a0
-        emit("addi sp, sp, 4");
-        
-        // a0 = a, a1 = b
-        // if (a < b) return a; else return b;
-        emit("slt t0, a0, a1"); // t0 = (a < b)
-        emit("beqz t0, " + getLabelName(elseLabel));
-        // a < b，返回 a (已在 a0 中)
-        emit("j " + getLabelName(endLabel));
-        emitLabel(getLabelName(elseLabel));
-        emit("addi a0, a1, 0"); // 返回 b
-        emitLabel(getLabelName(endLabel));
+        if (arg0Simple && arg1Simple) {
+            // 两个都是简单表达式，优化版本
+            tryLoadSimpleExprTo(expr->arguments[0].get(), "a0");
+            tryLoadSimpleExprTo(expr->arguments[1].get(), "a1");
+            // 使用条件移动避免跳转
+            emit("slt t0, a0, a1"); // t0 = (a0 < a1)
+            emit("beqz t0, .+8"); // 如果 a0 >= a1，跳过下一条
+            emit("j .+8"); // a0 < a1，直接跳到结尾
+            emit("addi a0, a1, 0"); // a0 >= a1，返回 a1
+        } else {
+            // 原有实现
+            generateExpression(expr->arguments[0].get()); // a -> a0
+            emit("addi sp, sp, -4");
+            emit("sw a0, 0(sp)"); // 保存 a
+            
+            generateExpression(expr->arguments[1].get()); // b -> a0
+            emit("addi a1, a0, 0"); // b -> a1
+            emit("lw a0, 0(sp)"); // a -> a0
+            emit("addi sp, sp, 4");
+            
+            // a0 = a, a1 = b
+            // if (a < b) return a; else return b;
+            emit("slt t0, a0, a1"); // t0 = (a < b)
+            int elseLabel = nextLabel();
+            int endLabel = nextLabel();
+            emit("beqz t0, " + getLabelName(elseLabel));
+            emit("j " + getLabelName(endLabel));
+            emitLabel(getLabelName(elseLabel));
+            emit("addi a0, a1, 0"); // 返回 b
+            emitLabel(getLabelName(endLabel));
+        }
         
     } else if (expr->functionName == "max" && expr->arguments.size() == 2) {
-        // 内联 max(a, b): a > b ? a : b
-        int elseLabel = nextLabel();
-        int endLabel = nextLabel();
+        // 优化内联 max(a, b): 更高效的实现
+        bool arg0Simple = isSimpleExpr(expr->arguments[0].get());
+        bool arg1Simple = isSimpleExpr(expr->arguments[1].get());
         
-        generateExpression(expr->arguments[0].get()); // a -> a0
-        emit("addi sp, sp, -4");
-        emit("sw a0, 0(sp)"); // 保存 a
-        
-        generateExpression(expr->arguments[1].get()); // b -> a0
-        emit("addi a1, a0, 0"); // b -> a1
-        emit("lw a0, 0(sp)"); // a -> a0
-        emit("addi sp, sp, 4");
-        
-        // a0 = a, a1 = b
-        // if (a > b) return a; else return b;
-        emit("sgt t0, a0, a1"); // t0 = (a > b)
-        emit("beqz t0, " + getLabelName(elseLabel));
-        // a > b，返回 a (已在 a0 中)
-        emit("j " + getLabelName(endLabel));
-        emitLabel(getLabelName(elseLabel));
-        emit("addi a0, a1, 0"); // 返回 b
-        emitLabel(getLabelName(endLabel));
+        if (arg0Simple && arg1Simple) {
+            // 两个都是简单表达式，优化版本
+            tryLoadSimpleExprTo(expr->arguments[0].get(), "a0");
+            tryLoadSimpleExprTo(expr->arguments[1].get(), "a1");
+            // 使用条件移动避免跳转
+            emit("sgt t0, a0, a1"); // t0 = (a0 > a1)
+            emit("beqz t0, .+8"); // 如果 a0 <= a1，跳过下一条
+            emit("j .+8"); // a0 > a1，直接跳到结尾
+            emit("addi a0, a1, 0"); // a0 <= a1，返回 a1
+        } else {
+            // 原有实现
+            generateExpression(expr->arguments[0].get()); // a -> a0
+            emit("addi sp, sp, -4");
+            emit("sw a0, 0(sp)"); // 保存 a
+            
+            generateExpression(expr->arguments[1].get()); // b -> a0
+            emit("addi a1, a0, 0"); // b -> a1
+            emit("lw a0, 0(sp)"); // a -> a0
+            emit("addi sp, sp, 4");
+            
+            // a0 = a, a1 = b
+            // if (a > b) return a; else return b;
+            emit("sgt t0, a0, a1"); // t0 = (a > b)
+            int elseLabel = nextLabel();
+            int endLabel = nextLabel();
+            emit("beqz t0, " + getLabelName(elseLabel));
+            emit("j " + getLabelName(endLabel));
+            emitLabel(getLabelName(elseLabel));
+            emit("addi a0, a1, 0"); // 返回 b
+            emitLabel(getLabelName(endLabel));
+        }
     }
 }
 
@@ -1990,6 +2049,44 @@ void CodeGenerator::analyzeAndAllocateLoopRegisters(WhileStatement *stmt) {
     // 禁用循环寄存器分配优化，避免嵌套循环中的寄存器冲突
     // 该优化在复杂嵌套循环中会导致寄存器错误分配，造成超时和错误结果
     return;
+}
+
+// 安全的简单循环寄存器分配
+void CodeGenerator::allocateSimpleLoopRegisters(WhileStatement *stmt) {
+    if (!stmt || !stmt->body) return;
+    
+    // 仅为最常见的循环模式分配寄存器：i, j, k 等单字符变量
+    std::unordered_set<std::string> candidateVars;
+    std::unordered_set<std::string> allLoopVars;
+    
+    // 收集循环中的所有变量
+    collectLoopVariables(stmt->body.get(), allLoopVars);
+    
+    // 识别简单的循环计数器（单字符，且在循环中频繁使用）
+    for (const std::string& var : allLoopVars) {
+        if (var.length() == 1 && (var == "i" || var == "j" || var == "k")) {
+            candidateVars.insert(var);
+        }
+    }
+    
+    // 为前3个候选变量分配t寄存器（t3, t4, t5避免与其他优化冲突）
+    std::vector<std::string> availableRegs = {"t3", "t4", "t5"};
+    int regIdx = 0;
+    
+    for (const std::string& var : candidateVars) {
+        if (regIdx >= availableRegs.size()) break;
+        if (variables.count(var)) {  // 确保变量存在
+            loopVarRegMap[var] = availableRegs[regIdx++];
+        }
+    }
+    
+    // 在循环开始前加载变量到寄存器
+    for (const auto& pair : loopVarRegMap) {
+        const std::string& varName = pair.first;
+        const std::string& regName = pair.second;
+        int offset = getVariableOffset(varName);
+        emit("lw " + regName + ", " + std::to_string(offset) + "(fp)");
+    }
 }
 
 // 收集循环中被修改的变量
@@ -2208,4 +2305,147 @@ void CodeGenerator::optimizeArrayIndexComputation(BinaryExpression *expr) {
     enableOptimizations = false;
     generateBinaryExpression(expr);
     enableOptimizations = oldEnableOpt;
+}
+
+// 检查是否为矩阵索引模式：(i * size + j) 或类似模式
+bool CodeGenerator::isMatrixIndexPattern(BinaryExpression *expr) {
+    if (!expr || expr->op != BinaryOp::ADD) return false;
+    
+    // 检查左边是否为乘法表达式
+    if (expr->left && expr->left->type == NodeType::BINARY_EXPR) {
+        auto* leftBin = static_cast<BinaryExpression*>(expr->left.get());
+        if (leftBin->op == BinaryOp::MUL) {
+            // 检查右边是否为简单变量或表达式
+            if (expr->right && 
+                (expr->right->type == NodeType::VARIABLE_EXPR || 
+                 expr->right->type == NodeType::LITERAL_EXPR)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// 优化矩阵索引计算
+void CodeGenerator::optimizeMatrixIndexCalculation(BinaryExpression *expr) {
+    if (!isMatrixIndexPattern(expr)) return;
+    
+    auto* mulExpr = static_cast<BinaryExpression*>(expr->left.get());
+    
+    // 检查是否为常量乘法
+    if (mulExpr->right && mulExpr->right->type == NodeType::LITERAL_EXPR) {
+        auto* literal = static_cast<LiteralExpression*>(mulExpr->right.get());
+        int multiplier = literal->value;
+        
+        // 对常见的矩阵大小进行特殊优化
+        if (multiplier == 2) {
+            // i * 2 + j = (i << 1) + j
+            generateExpression(mulExpr->left.get()); // i
+            emit("slli a0, a0, 1"); // i << 1
+            emit("addi t5, a0, 0"); // 保存到t5
+            generateExpression(expr->right.get()); // j
+            emit("add a0, t5, a0"); // i * 2 + j
+        } else if (multiplier == 3) {
+            // i * 3 + j = i + (i << 1) + j
+            generateExpression(mulExpr->left.get()); // i
+            emit("addi t5, a0, 0"); // t5 = i
+            emit("slli a0, a0, 1"); // i << 1
+            emit("add t5, t5, a0"); // t5 = i + (i << 1) = i * 3
+            generateExpression(expr->right.get()); // j
+            emit("add a0, t5, a0"); // i * 3 + j
+        } else if (multiplier == 4) {
+            // i * 4 + j = (i << 2) + j
+            generateExpression(mulExpr->left.get()); // i
+            emit("slli a0, a0, 2"); // i << 2
+            emit("addi t5, a0, 0"); // 保存到t5
+            generateExpression(expr->right.get()); // j
+            emit("add a0, t5, a0"); // i * 4 + j
+        } else {
+            // 通用优化：使用循环寄存器
+            if (inLoopContext && mulExpr->left->type == NodeType::VARIABLE_EXPR) {
+                auto* varExpr = static_cast<VariableExpression*>(mulExpr->left.get());
+                if (loopVarRegMap.count(varExpr->name)) {
+                    // 变量已在寄存器中
+                    const std::string& reg = loopVarRegMap[varExpr->name];
+                    emit("li t5, " + std::to_string(multiplier));
+                    emit("mul t5, " + reg + ", t5"); // t5 = i * multiplier
+                    generateExpression(expr->right.get()); // j
+                    emit("add a0, t5, a0"); // i * multiplier + j
+                    return;
+                }
+            }
+            // 默认情况
+            generateExpression(expr->left.get()); // i * multiplier
+            emit("addi t5, a0, 0");
+            generateExpression(expr->right.get()); // j
+            emit("add a0, t5, a0");
+        }
+    } else {
+        // 非常量乘法，使用默认处理
+        generateExpression(expr->left.get());
+        emit("addi t5, a0, 0");
+        generateExpression(expr->right.get());
+        emit("add a0, t5, a0");
+    }
+}
+
+// 优化小数乘法：2, 3, 5, 6, 7, 9等
+bool CodeGenerator::optimizeSmallMultiplication(BinaryExpression *expr) {
+    if (!expr || expr->op != BinaryOp::MUL) return false;
+    
+    // 查找常量操作数
+    Expression* varExpr = nullptr;
+    int multiplier = 0;
+    
+    if (expr->right && expr->right->type == NodeType::LITERAL_EXPR) {
+        multiplier = static_cast<LiteralExpression*>(expr->right.get())->value;
+        varExpr = expr->left.get();
+    } else if (expr->left && expr->left->type == NodeType::LITERAL_EXPR) {
+        multiplier = static_cast<LiteralExpression*>(expr->left.get())->value;
+        varExpr = expr->right.get();
+    }
+    
+    if (!varExpr || multiplier <= 1 || multiplier > 9) return false;
+    
+    generateExpression(varExpr); // 加载变量到a0
+    
+    switch (multiplier) {
+        case 3:
+            // x * 3 = x + (x << 1)
+            emit("addi t5, a0, 0"); // t5 = x
+            emit("slli a0, a0, 1"); // a0 = x << 1
+            emit("add a0, t5, a0"); // a0 = x + (x << 1)
+            break;
+        case 5:
+            // x * 5 = x + (x << 2)
+            emit("addi t5, a0, 0"); // t5 = x
+            emit("slli a0, a0, 2"); // a0 = x << 2
+            emit("add a0, t5, a0"); // a0 = x + (x << 2)
+            break;
+        case 6:
+            // x * 6 = (x << 1) + (x << 2) = 2x + 4x
+            emit("addi t5, a0, 0"); // t5 = x
+            emit("slli t5, t5, 1"); // t5 = x << 1 = 2x
+            emit("slli a0, a0, 2"); // a0 = x << 2 = 4x
+            emit("add a0, t5, a0"); // a0 = 2x + 4x = 6x
+            break;
+        case 7:
+            // x * 7 = x + (x << 1) + (x << 2) = x + 2x + 4x
+            emit("addi t5, a0, 0"); // t5 = x
+            emit("slli t6, a0, 1"); // t6 = x << 1 = 2x
+            emit("slli a0, a0, 2"); // a0 = x << 2 = 4x
+            emit("add t5, t5, t6"); // t5 = x + 2x = 3x
+            emit("add a0, t5, a0"); // a0 = 3x + 4x = 7x
+            break;
+        case 9:
+            // x * 9 = x + (x << 3)
+            emit("addi t5, a0, 0"); // t5 = x
+            emit("slli a0, a0, 3"); // a0 = x << 3
+            emit("add a0, t5, a0"); // a0 = x + (x << 3)
+            break;
+        default:
+            return false;
+    }
+    
+    return true;
 }

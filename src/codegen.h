@@ -128,6 +128,7 @@ class CodeGenerator
 
     // 循环寄存器优化
     void analyzeAndAllocateLoopRegisters(WhileStatement *stmt);
+    void allocateSimpleLoopRegisters(WhileStatement *stmt);
     void collectLoopVariables(Statement *stmt, std::unordered_set<std::string> &vars);
     bool isLoopInvariant(Expression *expr, const std::unordered_set<std::string> &loopVars);
     
@@ -140,6 +141,11 @@ class CodeGenerator
     // 数组索引计算优化
     bool isArrayIndexPattern(BinaryExpression *expr);
     void optimizeArrayIndexComputation(BinaryExpression *expr);
+    
+    // 矩阵索引计算优化
+    bool isMatrixIndexPattern(BinaryExpression *expr);
+    void optimizeMatrixIndexCalculation(BinaryExpression *expr);
+    bool optimizeSmallMultiplication(BinaryExpression *expr);
 
   public:
     CodeGenerator();
