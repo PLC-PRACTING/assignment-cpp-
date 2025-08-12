@@ -1977,11 +1977,12 @@ void CodeGenerator::generateInlinedCall(CallExpression *expr, FunctionDeclaratio
             // 两个都是简单表达式，优化版本
             tryLoadSimpleExprTo(expr->arguments[0].get(), "a0");
             tryLoadSimpleExprTo(expr->arguments[1].get(), "a1");
-            // 使用条件移动避免跳转
+            // 正确的条件跳转逻辑：如果 a0 < a1，返回 a0；否则返回 a1
             emit("slt t0, a0, a1"); // t0 = (a0 < a1)
-            emit("beqz t0, .+8"); // 如果 a0 >= a1，跳过下一条
-            emit("j .+8"); // a0 < a1，直接跳到结尾
+            int endLabel = nextLabel();
+            emit("bnez t0, " + getLabelName(endLabel)); // 如果 a0 < a1，跳到结尾 (返回a0)
             emit("addi a0, a1, 0"); // a0 >= a1，返回 a1
+            emitLabel(getLabelName(endLabel)); // a0 < a1，直接返回 a0
         } else {
             // 原有实现
             generateExpression(expr->arguments[0].get()); // a -> a0
@@ -2014,11 +2015,12 @@ void CodeGenerator::generateInlinedCall(CallExpression *expr, FunctionDeclaratio
             // 两个都是简单表达式，优化版本
             tryLoadSimpleExprTo(expr->arguments[0].get(), "a0");
             tryLoadSimpleExprTo(expr->arguments[1].get(), "a1");
-            // 使用条件移动避免跳转
+            // 正确的条件跳转逻辑：如果 a0 > a1，返回 a0；否则返回 a1
             emit("sgt t0, a0, a1"); // t0 = (a0 > a1)
-            emit("beqz t0, .+8"); // 如果 a0 <= a1，跳过下一条
-            emit("j .+8"); // a0 > a1，直接跳到结尾
+            int endLabel = nextLabel();
+            emit("bnez t0, " + getLabelName(endLabel)); // 如果 a0 > a1，跳到结尾 (返回a0)
             emit("addi a0, a1, 0"); // a0 <= a1，返回 a1
+            emitLabel(getLabelName(endLabel)); // a0 > a1，直接返回 a0
         } else {
             // 原有实现
             generateExpression(expr->arguments[0].get()); // a -> a0
