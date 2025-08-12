@@ -405,7 +405,10 @@ void CodeGenerator::generateFunction(FunctionDeclaration *func)
         for (size_t i = 8; i < func->parameters.size(); i++)
         {
             int destOffset = getVariableOffset(func->parameters[i].name); // negative in our frame
-            int srcOffset = static_cast<int>((i - 8) * 4); // positive from fp (caller frame)
+            // RISC-V calling convention: stack args are above the callee's fp
+            // The layout from bottom to top is: [caller frame][arg8][arg9]...[saved ra][saved fp <- fp points here]
+            // So args are at positive offsets from fp
+            int srcOffset = static_cast<int>((i - 8) * 4); // offset above fp for stack arguments
             emit("lw a0, " + std::to_string(srcOffset) + "(fp)");
             emit("sw a0, " + std::to_string(destOffset) + "(fp)");
         }
@@ -1301,6 +1304,39 @@ void CodeGenerator::generateBinaryExpression(BinaryExpression *expr)
                     generateExpression(expr->left.get());
                     emit("addi a0, a0, " + std::to_string(-immVal));
                     emit("snez a0, a0");
+                    return;
+                }
+                break;
+            default:
+                break;
+            }
+        }
+
+        // 右操作数为立即数的算术优化：
+        // - 加法：x + imm -> addi x, imm  
+        // - 减法：x - imm -> addi x, -imm
+        if (expr->right && expr->right->type == NodeType::LITERAL_EXPR)
+        {
+            int rv = static_cast<LiteralExpression *>(expr->right.get())->value;
+            switch (expr->op)
+            {
+            case BinaryOp::ADD:
+                if (isITypeImmediate(rv))
+                {
+                    generateExpression(expr->left.get());
+                    if (rv != 0) {
+                        emit("addi a0, a0, " + std::to_string(rv));
+                    }
+                    return;
+                }
+                break;
+            case BinaryOp::SUB:
+                if (isITypeImmediate(-rv))
+                {
+                    generateExpression(expr->left.get());
+                    if (rv != 0) {
+                        emit("addi a0, a0, " + std::to_string(-rv));
+                    }
                     return;
                 }
                 break;
