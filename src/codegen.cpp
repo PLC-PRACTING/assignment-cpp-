@@ -456,6 +456,16 @@ void CodeGenerator::generateWhileStatement(WhileStatement *stmt)
     loopBreakLabels.push_back(endLabel);
     loopContinueLabels.push_back(startLabel);
 
+    // 循环优化：分析并分配寄存器给频繁访问的变量
+    bool oldInLoopContext = inLoopContext;
+    inLoopContext = true;
+    std::unordered_map<std::string, std::string> oldLoopVarRegMap = loopVarRegMap;
+    
+    if (enableOptimizations) {
+        analyzeAndAllocateLoopRegisters(stmt);
+        hoistLoopInvariants(stmt);
+    }
+
     emitLabel(getLabelName(startLabel));
 
     // 禁用激进的不变式缓存，避免越界写栈导致错误结果
@@ -476,6 +486,24 @@ void CodeGenerator::generateWhileStatement(WhileStatement *stmt)
     emit("j " + getLabelName(startLabel));
 
     emitLabel(getLabelName(endLabel));
+    
+    // 循环结束后将寄存器值写回内存
+    if (enableOptimizations) {
+        for (const auto& pair : loopVarRegMap) {
+            const std::string& var = pair.first;
+            const std::string& reg = pair.second;
+            try {
+                int offset = getVariableOffset(var);
+                emit("sw " + reg + ", " + std::to_string(offset) + "(fp)");
+            } catch (...) {
+                // 变量不存在，跳过
+            }
+        }
+    }
+    
+    // 恢复循环上下文
+    inLoopContext = oldInLoopContext;
+    loopVarRegMap = oldLoopVarRegMap;
 
     loopBreakLabels.pop_back();
     loopContinueLabels.pop_back();
@@ -517,6 +545,12 @@ void CodeGenerator::generateAssignStatement(AssignStatement *stmt)
     generateExpression(stmt->expression.get());
     int offset = getVariableOffset(stmt->variable);
     emit("sw a0, " + std::to_string(offset) + "(fp)");
+    
+    // 循环中同时更新寄存器
+    if (inLoopContext && loopVarRegMap.count(stmt->variable)) {
+        const std::string& reg = loopVarRegMap[stmt->variable];
+        emit("addi " + reg + ", a0, 0"); // 将a0值复制到寄存器
+    }
 }
 
 void CodeGenerator::generateVarDeclStatement(VarDeclStatement *stmt)
@@ -899,6 +933,11 @@ void CodeGenerator::generateBinaryExpression(BinaryExpression *expr)
     }
     else
     {
+        // 数组索引计算优化
+        if (enableOptimizations && isArrayIndexPattern(expr)) {
+            optimizeArrayIndexComputation(expr);
+            return;
+        }
         // Same-variable optimization: handle x op x cases
         // 检查是否为同变量表达式
         bool sameVariable = false;
@@ -1772,6 +1811,13 @@ void CodeGenerator::generateLiteralExpression(LiteralExpression *expr)
 
 void CodeGenerator::generateVariableExpression(VariableExpression *expr)
 {
+    // 循环中优先使用寄存器
+    if (inLoopContext && loopVarRegMap.count(expr->name)) {
+        const std::string& reg = loopVarRegMap[expr->name];
+        emit("addi a0, " + reg + ", 0"); // 将寄存器值复制到a0
+        return;
+    }
+    
     int offset = getVariableOffset(expr->name);
     // 保守寄存器复用：若 a0 已经持有同一槽位的值且中间无调用/破坏，则无需再次 lw
     if (a0HoldsVariable && a0HeldVarOffset == offset)
@@ -1786,6 +1832,16 @@ void CodeGenerator::generateVariableExpression(VariableExpression *expr)
 void CodeGenerator::generateCallExpression(CallExpression *expr)
 {
     invalidateA0Cache();
+    
+    // 检查是否应该内联函数
+    if (enableOptimizations && shouldInlineFunction(expr->functionName)) {
+        auto it = functions.find(expr->functionName);
+        if (it != functions.end()) {
+            generateInlinedCall(expr, it->second);
+            return;
+        }
+    }
+    
     size_t argCount = expr->arguments.size();
 
     if (argCount == 0)
@@ -1875,4 +1931,318 @@ void CodeGenerator::generateCallExpression(CallExpression *expr)
     // 5) Release frame
     emit("addi sp, sp, " + std::to_string(alignedBytes));
     invalidateA0Cache();
+}
+
+// 判断函数是否应该内联
+bool CodeGenerator::shouldInlineFunction(const std::string &functionName) {
+    // 内联常见的小型函数
+    if (functionName == "min" || functionName == "max") {
+        return true;
+    }
+    return false;
+}
+
+// 判断函数是否可以内联
+bool CodeGenerator::canInlineFunction(FunctionDeclaration *func) {
+    if (!func) return false;
+    
+    // 简单检查：只内联单个return语句的函数
+    if (func->body && func->body->statements.size() == 1) {
+        auto stmt = func->body->statements[0].get();
+        return stmt && stmt->type == NodeType::RETURN_STMT;
+    }
+    return false;
+}
+
+// 生成内联函数调用
+void CodeGenerator::generateInlinedCall(CallExpression *expr, FunctionDeclaration *func) {
+    if (expr->functionName == "min" && expr->arguments.size() == 2) {
+        // 内联 min(a, b): a < b ? a : b
+        generateExpression(expr->arguments[0].get()); // a -> a0
+        emit("addi sp, sp, -4");
+        emit("sw a0, 0(sp)"); // 保存 a
+        
+        generateExpression(expr->arguments[1].get()); // b -> a0
+        emit("addi a1, a0, 0"); // b -> a1
+        emit("lw a0, 0(sp)"); // a -> a0
+        emit("addi sp, sp, 4");
+        
+        // a0 = a, a1 = b
+        // if (a < b) return a; else return b;
+        emit("slt t0, a0, a1"); // t0 = (a < b)
+        emit("beqz t0, .L_min_else_" + std::to_string(nextLabel()));
+        // a < b，返回 a (已在 a0 中)
+        emit("j .L_min_end_" + std::to_string(labelCounter));
+        emitLabel(".L_min_else_" + std::to_string(labelCounter));
+        emit("addi a0, a1, 0"); // 返回 b
+        emitLabel(".L_min_end_" + std::to_string(labelCounter));
+        
+    } else if (expr->functionName == "max" && expr->arguments.size() == 2) {
+        // 内联 max(a, b): a > b ? a : b
+        generateExpression(expr->arguments[0].get()); // a -> a0
+        emit("addi sp, sp, -4");
+        emit("sw a0, 0(sp)"); // 保存 a
+        
+        generateExpression(expr->arguments[1].get()); // b -> a0
+        emit("addi a1, a0, 0"); // b -> a1
+        emit("lw a0, 0(sp)"); // a -> a0
+        emit("addi sp, sp, 4");
+        
+        // a0 = a, a1 = b
+        // if (a > b) return a; else return b;
+        emit("sgt t0, a0, a1"); // t0 = (a > b)
+        emit("beqz t0, .L_max_else_" + std::to_string(nextLabel()));
+        // a > b，返回 a (已在 a0 中)
+        emit("j .L_max_end_" + std::to_string(labelCounter));
+        emitLabel(".L_max_else_" + std::to_string(labelCounter));
+        emit("addi a0, a1, 0"); // 返回 b
+        emitLabel(".L_max_end_" + std::to_string(labelCounter));
+    }
+}
+
+// 分析并为循环变量分配寄存器
+void CodeGenerator::analyzeAndAllocateLoopRegisters(WhileStatement *stmt) {
+    if (!stmt || !stmt->body) return;
+    
+    // 收集循环中被修改的变量
+    std::unordered_set<std::string> loopVars;
+    collectLoopVariables(stmt->body.get(), loopVars);
+    
+    // 为最频繁访问的变量分配临时寄存器
+    // 简化策略：为循环计数器分配寄存器
+    std::vector<std::string> availableRegs = {"t1", "t2", "t3", "t4"};
+    int regIndex = 0;
+    
+    for (const auto& var : loopVars) {
+        if (regIndex < static_cast<int>(availableRegs.size())) {
+            loopVarRegMap[var] = availableRegs[regIndex];
+            // 在循环开始前加载变量到寄存器
+            try {
+                int offset = getVariableOffset(var);
+                emit("lw " + availableRegs[regIndex] + ", " + std::to_string(offset) + "(fp)");
+            } catch (...) {
+                // 如果变量不存在，跳过
+                continue;
+            }
+            regIndex++;
+        }
+    }
+}
+
+// 收集循环中被修改的变量
+void CodeGenerator::collectLoopVariables(Statement *stmt, std::unordered_set<std::string> &vars) {
+    if (!stmt) return;
+    
+    switch (stmt->type) {
+        case NodeType::ASSIGN_STMT: {
+            auto* assign = static_cast<AssignStatement*>(stmt);
+            vars.insert(assign->variable);
+            break;
+        }
+        case NodeType::VAR_DECL_STMT: {
+            auto* decl = static_cast<VarDeclStatement*>(stmt);
+            vars.insert(decl->name);
+            break;
+        }
+        case NodeType::BLOCK_STMT: {
+            auto* block = static_cast<BlockStatement*>(stmt);
+            for (auto& s : block->statements) {
+                collectLoopVariables(s.get(), vars);
+            }
+            break;
+        }
+        case NodeType::IF_STMT: {
+            auto* ifStmt = static_cast<IfStatement*>(stmt);
+            collectLoopVariables(ifStmt->thenStmt.get(), vars);
+            if (ifStmt->elseStmt) {
+                collectLoopVariables(ifStmt->elseStmt.get(), vars);
+            }
+            break;
+        }
+        case NodeType::WHILE_STMT: {
+            auto* whileStmt = static_cast<WhileStatement*>(stmt);
+            collectLoopVariables(whileStmt->body.get(), vars);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// 检查表达式是否为循环不变式
+bool CodeGenerator::isLoopInvariant(Expression *expr, const std::unordered_set<std::string> &loopVars) {
+    if (!expr) return true;
+    
+    switch (expr->type) {
+        case NodeType::LITERAL_EXPR:
+            return true;
+        case NodeType::VARIABLE_EXPR: {
+            auto* varExpr = static_cast<VariableExpression*>(expr);
+            return loopVars.find(varExpr->name) == loopVars.end();
+        }
+        case NodeType::BINARY_EXPR: {
+            auto* binExpr = static_cast<BinaryExpression*>(expr);
+            return isLoopInvariant(binExpr->left.get(), loopVars) &&
+                   isLoopInvariant(binExpr->right.get(), loopVars);
+        }
+        case NodeType::UNARY_EXPR: {
+            auto* unExpr = static_cast<UnaryExpression*>(expr);
+            return isLoopInvariant(unExpr->operand.get(), loopVars);
+        }
+        case NodeType::CALL_EXPR:
+            return false; // 函数调用可能有副作用
+        default:
+            return false;
+    }
+}
+
+// 循环不变量外提
+void CodeGenerator::hoistLoopInvariants(WhileStatement *stmt) {
+    if (!stmt || !stmt->body) return;
+    
+    // 收集循环变量
+    std::unordered_set<std::string> loopVars;
+    collectLoopVariables(stmt->body.get(), loopVars);
+    
+    // 查找不变式表达式  
+    std::vector<Expression*> invariants;
+    findInvariantExpressions(stmt->body.get(), loopVars, invariants);
+    
+    // 在循环前生成不变式计算
+    generateHoistedInvariants(invariants);
+}
+
+// 查找循环不变式表达式
+void CodeGenerator::findInvariantExpressions(Statement *stmt, const std::unordered_set<std::string> &loopVars,
+                                           std::vector<Expression*> &invariants) {
+    if (!stmt) return;
+    
+    switch (stmt->type) {
+        case NodeType::ASSIGN_STMT: {
+            auto* assign = static_cast<AssignStatement*>(stmt);
+            if (assign->expression && isLoopInvariant(assign->expression.get(), loopVars)) {
+                invariants.push_back(assign->expression.get());
+            }
+            break;
+        }
+        case NodeType::EXPR_STMT: {
+            auto* exprStmt = static_cast<ExpressionStatement*>(stmt);
+            if (exprStmt->expression && isLoopInvariant(exprStmt->expression.get(), loopVars)) {
+                invariants.push_back(exprStmt->expression.get());
+            }
+            break;
+        }
+        case NodeType::BLOCK_STMT: {
+            auto* block = static_cast<BlockStatement*>(stmt);
+            for (auto& s : block->statements) {
+                findInvariantExpressions(s.get(), loopVars, invariants);
+            }
+            break;
+        }
+        case NodeType::IF_STMT: {
+            auto* ifStmt = static_cast<IfStatement*>(stmt);
+            findInvariantExpressions(ifStmt->thenStmt.get(), loopVars, invariants);
+            if (ifStmt->elseStmt) {
+                findInvariantExpressions(ifStmt->elseStmt.get(), loopVars, invariants);
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// 生成外提的不变式计算
+void CodeGenerator::generateHoistedInvariants(const std::vector<Expression*> &invariants) {
+    for (Expression* expr : invariants) {
+        if (!expr) continue;
+        
+        // 为每个不变式分配一个临时栈槽并预计算
+        std::string key = serializeExpr(expr);
+        if (invariantExprToOffset.find(key) == invariantExprToOffset.end()) {
+            int slot = stackOffset;
+            stackOffset -= 4;
+            invariantExprToOffset[key] = slot;
+            
+            // 生成计算代码（绕过缓存查找）
+            invariantComputeBypass = true;
+            generateExpression(expr);
+            invariantComputeBypass = false;
+            
+            // 存储结果到预分配的槽位
+            emit("sw a0, " + std::to_string(slot) + "(fp)");
+        }
+    }
+    
+    // 启用循环内的不变式复用
+    invariantReuseEnabled = true;
+}
+
+// 检查是否为数组索引模式 (i * size + j)
+bool CodeGenerator::isArrayIndexPattern(BinaryExpression *expr) {
+    if (!expr || expr->op != BinaryOp::ADD) return false;
+    
+    // 检查模式: (var1 * const + var2) 或 (const * var1 + var2)
+    if (expr->left && expr->left->type == NodeType::BINARY_EXPR) {
+        auto* leftBin = static_cast<BinaryExpression*>(expr->left.get());
+        if (leftBin->op == BinaryOp::MUL) {
+            // 左边是乘法，右边是变量或常量
+            return true;
+        }
+    }
+    return false;
+}
+
+// 优化数组索引计算
+void CodeGenerator::optimizeArrayIndexComputation(BinaryExpression *expr) {
+    // 处理 (i * size + j) 模式
+    if (expr->op == BinaryOp::ADD && expr->left && expr->left->type == NodeType::BINARY_EXPR) {
+        auto* mulExpr = static_cast<BinaryExpression*>(expr->left.get());
+        if (mulExpr->op == BinaryOp::MUL) {
+            // 检查是否有常量可以优化
+            if (mulExpr->right && mulExpr->right->type == NodeType::LITERAL_EXPR) {
+                int multiplier = static_cast<LiteralExpression*>(mulExpr->right.get())->value;
+                
+                // 对于常见的矩阵大小进行优化
+                if (multiplier == 3) {
+                    // i * 3 = i + i * 2 = i + (i << 1)
+                    generateExpression(mulExpr->left.get()); // i -> a0
+                    emit("slli a1, a0, 1"); // a1 = i * 2
+                    emit("add a0, a0, a1"); // a0 = i + i * 2 = i * 3
+                } else if ((multiplier & (multiplier - 1)) == 0) {
+                    // 2的幂次优化
+                    generateExpression(mulExpr->left.get());
+                    int shift = 0;
+                    int temp = multiplier;
+                    while (temp > 1) {
+                        temp >>= 1;
+                        shift++;
+                    }
+                    emit("slli a0, a0, " + std::to_string(shift));
+                } else {
+                    // 一般乘法优化
+                    generateExpression(mulExpr->left.get()); // i
+                    emit("li a1, " + std::to_string(multiplier));
+                    emit("mul a0, a0, a1");
+                }
+                
+                // 保存第一部分结果
+                emit("addi t5, a0, 0"); // t5 = i * size
+                
+                // 计算第二部分 (j)
+                generateExpression(expr->right.get()); // j -> a0
+                
+                // 最终加法
+                emit("add a0, t5, a0"); // a0 = i * size + j
+                return;
+            }
+        }
+    }
+    
+    // 如果不能优化，使用默认处理
+    // 通过常规二元表达式处理其余逻辑，但跳过优化检查
+    bool oldEnableOpt = enableOptimizations;
+    enableOptimizations = false;
+    generateBinaryExpression(expr);
+    enableOptimizations = oldEnableOpt;
 }

@@ -121,6 +121,26 @@ class CodeGenerator
     bool isSimpleExpr(Expression *expr);
     bool expressionContainsCall(Expression *expr);
 
+    // 函数内联优化
+    bool shouldInlineFunction(const std::string &functionName);
+    bool canInlineFunction(FunctionDeclaration *func);
+    void generateInlinedCall(CallExpression *expr, FunctionDeclaration *func);
+
+    // 循环寄存器优化
+    void analyzeAndAllocateLoopRegisters(WhileStatement *stmt);
+    void collectLoopVariables(Statement *stmt, std::unordered_set<std::string> &vars);
+    bool isLoopInvariant(Expression *expr, const std::unordered_set<std::string> &loopVars);
+    
+    // 循环不变量外提优化
+    void hoistLoopInvariants(WhileStatement *stmt);
+    void findInvariantExpressions(Statement *stmt, const std::unordered_set<std::string> &loopVars, 
+                                  std::vector<Expression*> &invariants);
+    void generateHoistedInvariants(const std::vector<Expression*> &invariants);
+    
+    // 数组索引计算优化
+    bool isArrayIndexPattern(BinaryExpression *expr);
+    void optimizeArrayIndexComputation(BinaryExpression *expr);
+
   public:
     CodeGenerator();
     std::string generate(Program *program);
