@@ -193,15 +193,10 @@ void CodeGenerator::generateFunctionPrologue(const std::string &funcName, int lo
 {
     emitLabel(funcName);
 
-    // 优化：对于叶函数且局部变量少的情况，减少栈帧大小
-    int frameSize = (localVarCount + 2) * 4;   // ra, fp, and local variables
+    // Calculate stack space needed with larger buffer for complex cases
+    // Local variables + saved registers; 对齐到 16 字节即可
+    int frameSize = localVarCount * 4;   // ra, fp, and local variables already counted
     int maxStackSize = (frameSize + 15) & ~15; // Align to 16 bytes
-
-    // 进一步优化：如果只有少量局部变量，使用更紧凑的栈帧
-    if (localVarCount <= 2 && enableOptimizations)
-    {
-        maxStackSize = 16; // 最小16字节对齐栈帧
-    }
 
     currentStackSize = maxStackSize;
 
@@ -370,9 +365,9 @@ void CodeGenerator::generateFunction(FunctionDeclaration *func)
         }
     };
 
-    // Calculate proper stack layout（为所有形参保留槽位，避免间隔导致的越界/重叠）
+    // Calculate proper stack layout
     int paramCount = static_cast<int>(func->parameters.size());
-    int totalLocals = localVarCount + paramCount; // 保存槽位数（不含 ra/fp）
+    int totalLocals = localVarCount + paramCount + 2; // +2 for ra and fp
 
     // Add parameters to variable map (negative offsets from fp)
     // Prologue saves ra at -4(fp) and fp at -8(fp), so first free slot is -12(fp)
@@ -515,7 +510,10 @@ void CodeGenerator::generateIfStatement(IfStatement *stmt)
 
     if (stmt->elseStmt)
     {
-        emit("j " + getLabelName(endLabel));
+        if (!thenIsUnreachable)
+        {
+            emit("j " + getLabelName(endLabel));
+        }
         emitLabel(getLabelName(elseLabel));
 
         isUnreachable = false; // Reset for else branch
