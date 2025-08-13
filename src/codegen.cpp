@@ -17,34 +17,18 @@ CodeGenerator::CodeGenerator()
 void CodeGenerator::emit(const std::string &instruction)
 {
     output << "    " << instruction << '\n';
-    // 写栈/读栈或对寄存器赋新值的指令，会导致缓存失效
-    // 保守策略：检查指令是否可能破坏寄存器缓存
-    
-    // 检查a0缓存失效
-    if (instruction.rfind("lw a0,", 0) != 0 && instruction.find("a0") != std::string::npos)
+    // 写栈/读栈或对 a0 赋新值的指令，会导致 a0 的缓存失效
+    // 这里做一个极其保守的失效：只要不是以 "lw a0," 开头就清空缓存
+    if (instruction.rfind("lw a0,", 0) != 0)
     {
         a0HoldsVariable = false;
-    }
-    
-    // 检查t寄存器缓存失效
-    if (instruction.find("t0") != std::string::npos && instruction.find("lw t0,") != 0)
-    {
-        t0Cache.clear();
-    }
-    if (instruction.find("t1") != std::string::npos && instruction.find("lw t1,") != 0)
-    {
-        t1Cache.clear();
-    }
-    if (instruction.find("t2") != std::string::npos && instruction.find("lw t2,") != 0)
-    {
-        t2Cache.clear();
     }
 }
 
 void CodeGenerator::emitLabel(const std::string &label)
 {
     output << label << ":" << '\n';
-    invalidateAllCaches();
+    invalidateA0Cache();
 }
 
 int CodeGenerator::nextLabel()
@@ -61,33 +45,6 @@ void CodeGenerator::invalidateA0Cache()
 {
     a0HoldsVariable = false;
     a1HoldsVariable = false;
-}
-
-void CodeGenerator::invalidateAllCaches()
-{
-    a0Cache.clear();
-    t0Cache.clear();
-    t1Cache.clear();
-    t2Cache.clear();
-    a1HoldsVariable = false;
-}
-
-CodeGenerator::RegisterCache* CodeGenerator::findCachedVariable(int offset)
-{
-    if (a0Cache.holdsVariable && a0Cache.heldVarOffset == offset) return &a0Cache;
-    if (t0Cache.holdsVariable && t0Cache.heldVarOffset == offset) return &t0Cache;
-    if (t1Cache.holdsVariable && t1Cache.heldVarOffset == offset) return &t1Cache;
-    if (t2Cache.holdsVariable && t2Cache.heldVarOffset == offset) return &t2Cache;
-    return nullptr;
-}
-
-CodeGenerator::RegisterCache* CodeGenerator::findAvailableRegister()
-{
-    if (!t0Cache.holdsVariable) return &t0Cache;
-    if (!t1Cache.holdsVariable) return &t1Cache;
-    if (!t2Cache.holdsVariable) return &t2Cache;
-    // 如果都被占用，淘汰t0（最不常用）
-    return &t0Cache;
 }
 
 // 将表达式序列化为一个可比较的字符串（保守、忽略临时标签）
@@ -538,13 +495,6 @@ void CodeGenerator::generateContinueStatement(ContinueStatement *stmt)
 void CodeGenerator::generateAssignStatement(AssignStatement *stmt)
 {
     generateExpression(stmt->expression.get());
-    
-    // 尝试更新常量值用于常量传播
-    if (enableOptimizations) {
-        auto constValue = tryConstantFolding(stmt->expression.get());
-        constantValues[stmt->variable] = constValue;
-    }
-    
     int offset = getVariableOffset(stmt->variable);
     emit("sw a0, " + std::to_string(offset) + "(fp)");
 }
@@ -565,12 +515,6 @@ void CodeGenerator::generateVarDeclStatement(VarDeclStatement *stmt)
     variables[stmt->name] = stackOffset;
     int offset = stackOffset;
     stackOffset -= 4;
-
-    // 尝试记录常量值用于常量传播
-    if (enableOptimizations) {
-        auto constValue = tryConstantFolding(stmt->initializer.get());
-        constantValues[stmt->name] = constValue;
-    }
 
     emit("sw a0, " + std::to_string(offset) + "(fp)");
 
@@ -657,17 +601,6 @@ std::optional<int> CodeGenerator::tryConstantFolding(Expression *expr)
     {
     case NodeType::LITERAL_EXPR:
         return static_cast<LiteralExpression *>(expr)->value;
-    case NodeType::VARIABLE_EXPR: {
-        // 尝试从常量值表中查找变量的常量值
-        if (enableOptimizations) {
-            auto *varExpr = static_cast<VariableExpression *>(expr);
-            auto it = constantValues.find(varExpr->name);
-            if (it != constantValues.end() && it->second.has_value()) {
-                return it->second.value();
-            }
-        }
-        return std::nullopt;
-    }
     case NodeType::BINARY_EXPR: {
         auto binExpr = static_cast<BinaryExpression *>(expr);
         auto leftVal = tryConstantFolding(binExpr->left.get());
@@ -704,13 +637,9 @@ std::optional<int> CodeGenerator::tryConstantFolding(Expression *expr)
             case BinaryOp::NE:
                 return *leftVal != *rightVal;
             case BinaryOp::AND:
-                // 短路求值：如果左操作数为假，结果为假
-                if (*leftVal == 0) return 0;
-                return *rightVal != 0 ? 1 : 0;
+                return *leftVal && *rightVal;
             case BinaryOp::OR:
-                // 短路求值：如果左操作数为真，结果为真  
-                if (*leftVal != 0) return 1;
-                return *rightVal != 0 ? 1 : 0;
+                return *leftVal || *rightVal;
             }
         }
         break;
@@ -751,7 +680,7 @@ std::optional<int> CodeGenerator::getPowerOfTwoShift(Expression *expr)
     return std::nullopt;
 }
 
-// 将简单表达式直接生成到指定寄存器，优先使用缓存
+// 将简单表达式直接生成到指定寄存器，当前仅支持立即数与局部变量加载
 bool CodeGenerator::tryLoadSimpleExprTo(Expression *expr, const char *regName)
 {
     if (!expr)
@@ -766,42 +695,7 @@ bool CodeGenerator::tryLoadSimpleExprTo(Expression *expr, const char *regName)
     {
         auto *ve = static_cast<VariableExpression *>(expr);
         int offset = getVariableOffset(ve->name);
-        
-        // 检查是否有寄存器已经缓存了该变量
-        if (enableOptimizations) 
-        {
-            RegisterCache* cached = findCachedVariable(offset);
-            if (cached) 
-            {
-                // 从缓存的寄存器复制值
-                emit(std::string("addi ") + regName + ", " + cached->regName + ", 0");
-                return true;
-            }
-        }
-        
-        // 没有缓存，从内存加载
         emit(std::string("lw ") + regName + ", " + std::to_string(offset) + "(fp)");
-        
-        // 如果目标寄存器是t寄存器且启用优化，更新缓存
-        if (enableOptimizations && regName[0] == 't') 
-        {
-            if (std::string(regName) == "t0") 
-            {
-                t0Cache.holdsVariable = true;
-                t0Cache.heldVarOffset = offset;
-            }
-            else if (std::string(regName) == "t1") 
-            {
-                t1Cache.holdsVariable = true;
-                t1Cache.heldVarOffset = offset;
-            }
-            else if (std::string(regName) == "t2") 
-            {
-                t2Cache.holdsVariable = true;
-                t2Cache.heldVarOffset = offset;
-            }
-        }
-        
         return true;
     }
     return false;
@@ -1127,51 +1021,6 @@ void CodeGenerator::generateBinaryExpression(BinaryExpression *expr)
                     emit("neg a0, a0");
                     return;
                 }
-                // 扩展更多小常数乘法优化
-                else if (immVal == 3)
-                {
-                    generateExpression(expr->left.get());
-                    emit("slli t0, a0, 1");    // t0 = x * 2
-                    emit("add a0, a0, t0");    // a0 = x + x*2 = x*3
-                    return;
-                }
-                else if (immVal == 5)
-                {
-                    generateExpression(expr->left.get());
-                    emit("slli t0, a0, 2");    // t0 = x * 4
-                    emit("add a0, a0, t0");    // a0 = x + x*4 = x*5
-                    return;
-                }
-                else if (immVal == 6)
-                {
-                    generateExpression(expr->left.get());
-                    emit("slli t0, a0, 1");    // t0 = x * 2
-                    emit("slli a0, a0, 2");    // a0 = x * 4
-                    emit("add a0, a0, t0");    // a0 = x*4 + x*2 = x*6
-                    return;
-                }
-                else if (immVal == 7)
-                {
-                    generateExpression(expr->left.get());
-                    emit("slli t0, a0, 3");    // t0 = x * 8
-                    emit("sub a0, t0, a0");    // a0 = x*8 - x = x*7
-                    return;
-                }
-                else if (immVal == 9)
-                {
-                    generateExpression(expr->left.get());
-                    emit("slli t0, a0, 3");    // t0 = x * 8
-                    emit("add a0, a0, t0");    // a0 = x + x*8 = x*9
-                    return;
-                }
-                else if (immVal == 10)
-                {
-                    generateExpression(expr->left.get());
-                    emit("slli t0, a0, 3");    // t0 = x * 8
-                    emit("slli t1, a0, 1");    // t1 = x * 2
-                    emit("add a0, t0, t1");    // a0 = x*8 + x*2 = x*10
-                    return;
-                }
                 break;
             case BinaryOp::DIV:
                 if (immVal == 1)
@@ -1185,29 +1034,6 @@ void CodeGenerator::generateBinaryExpression(BinaryExpression *expr)
                 {
                     generateExpression(expr->left.get());
                     emit("li a0, 0");
-                    return;
-                }
-                break;
-            // 扩展加减法立即数优化
-            case BinaryOp::ADD:
-                if (isITypeImmediate(immVal))
-                {
-                    generateExpression(expr->left.get());
-                    if (immVal != 0)
-                    {
-                        emit("addi a0, a0, " + std::to_string(immVal));
-                    }
-                    return;
-                }
-                break;
-            case BinaryOp::SUB:
-                if (isITypeImmediate(-immVal))
-                {
-                    generateExpression(expr->left.get());
-                    if (immVal != 0)
-                    {
-                        emit("addi a0, a0, " + std::to_string(-immVal));
-                    }
                     return;
                 }
                 break;
@@ -1422,7 +1248,24 @@ void CodeGenerator::generateBinaryExpression(BinaryExpression *expr)
         else if (!leftSimple && rightSimple)
         {
             generateExpression(expr->left.get()); // a0
-            tryLoadSimpleExprTo(expr->right.get(), "a1");
+            
+            // 检查是否可以使用立即数优化，如果可以则不加载a1
+            bool useImmediateOpt = false;
+            if (expr->op == BinaryOp::ADD && expr->right->type == NodeType::LITERAL_EXPR)
+            {
+                int rv = static_cast<LiteralExpression*>(expr->right.get())->value;
+                useImmediateOpt = isITypeImmediate(rv);
+            }
+            else if (expr->op == BinaryOp::SUB && expr->right->type == NodeType::LITERAL_EXPR)
+            {
+                int rv = static_cast<LiteralExpression*>(expr->right.get())->value;
+                useImmediateOpt = isITypeImmediate(-rv);
+            }
+            
+            if (!useImmediateOpt)
+            {
+                tryLoadSimpleExprTo(expr->right.get(), "a1");
+            }
         }
         else if (leftSimple && !rightSimple)
         {
@@ -1644,44 +1487,19 @@ void CodeGenerator::generateLiteralExpression(LiteralExpression *expr)
 void CodeGenerator::generateVariableExpression(VariableExpression *expr)
 {
     int offset = getVariableOffset(expr->name);
-    
-    // 检查是否有寄存器已经缓存了该变量
-    RegisterCache* cached = findCachedVariable(offset);
-    if (cached && cached->regName != "a0") 
-    {
-        // 将缓存的值移动到a0
-        emit("addi a0, " + cached->regName + ", 0");  // mv a0, cached_reg
-        a0Cache.holdsVariable = true;
-        a0Cache.heldVarOffset = offset;
-        return;
-    }
-    
     // 保守寄存器复用：若 a0 已经持有同一槽位的值且中间无调用/破坏，则无需再次 lw
     if (a0HoldsVariable && a0HeldVarOffset == offset)
     {
         return;
     }
-    
     emit("lw a0, " + std::to_string(offset) + "(fp)");
     a0HoldsVariable = true;
     a0HeldVarOffset = offset;
-    
-    // 尝试将变量值也缓存到t寄存器中，为后续使用做准备
-    if (enableOptimizations) 
-    {
-        RegisterCache* availReg = findAvailableRegister();
-        if (availReg && availReg->regName != "a0") 
-        {
-            emit("addi " + availReg->regName + ", a0, 0");  // mv t_reg, a0
-            availReg->holdsVariable = true;
-            availReg->heldVarOffset = offset;
-        }
-    }
 }
 
 void CodeGenerator::generateCallExpression(CallExpression *expr)
 {
-    invalidateAllCaches();
+    invalidateA0Cache();
     size_t argCount = expr->arguments.size();
 
     if (argCount == 0)
@@ -1727,73 +1545,41 @@ void CodeGenerator::generateCallExpression(CallExpression *expr)
         return;
     }
 
-    // 中间优化策略：区分简单和复杂参数，只为复杂参数分配临时存储
-    std::vector<bool> isSimpleArg(argCount);
-    int complexArgs = 0;
-    for (size_t i = 0; i < argCount; i++) 
-    {
-        isSimpleArg[i] = isSimpleExpr(expr->arguments[i].get()) && !exprHasCallRecursive(expr->arguments[i].get());
-        if (!isSimpleArg[i]) complexArgs++;
-    }
-    
+    // 保守策略：为避免嵌套调用破坏，使用临时区缓存所有参数再搬运
+
     int extraArgs = static_cast<int>(argCount > 8 ? argCount - 8 : 0);
-    int spillAreaBytes = extraArgs * 4;                  // area visible to callee for args >8
-    int tempAreaBytes = complexArgs * 4;                 // only store complex evaluated args
-    int totalBytes = spillAreaBytes + tempAreaBytes;     // no caller-saved ra
-    int alignedBytes = (totalBytes + 15) & ~15;          // 16-byte alignment
+    int spillAreaBytes = extraArgs * 4;                 // area visible to callee for args >8
+    int tempAreaBytes = static_cast<int>(argCount) * 4; // store all evaluated args
+    int totalBytes = spillAreaBytes + tempAreaBytes;    // no caller-saved ra
+    int alignedBytes = (totalBytes + 15) & ~15;         // 16-byte alignment
 
     emit("addi sp, sp, -" + std::to_string(alignedBytes));
 
     // Base offsets
     int tempBase = spillAreaBytes; // temporary args start after spill area
 
-    // 1) 计算复杂参数并存储到临时区，记录简单参数位置
-    int tempSlot = 0;
-    std::unordered_map<int, int> complexArgTempOffset; // arg_index -> temp_offset
-    
+    // 1) Evaluate all arguments left-to-right, store each to temporary area
     for (size_t i = 0; i < argCount; i++)
     {
-        if (!isSimpleArg[i]) 
-        {
-            generateExpression(expr->arguments[i].get());
-            int offset = tempBase + tempSlot * 4;
-            emit("sw a0, " + std::to_string(offset) + "(sp)");
-            complexArgTempOffset[i] = offset;
-            tempSlot++;
-        }
+        generateExpression(expr->arguments[i].get());
+        emit("sw a0, " + std::to_string(tempBase + static_cast<int>(i) * 4) + "(sp)");
     }
 
-    // 2) 将前8个参数加载到a0-a7，优先直接加载简单参数
+    // 2) Move first 8 args into a0-a7 from temporary area
     for (size_t i = 0; i < std::min<size_t>(8, argCount); i++)
     {
-        if (isSimpleArg[i]) 
-        {
-            // 简单参数直接加载
-            tryLoadSimpleExprTo(expr->arguments[i].get(), ("a" + std::to_string(i)).c_str());
-        } 
-        else 
-        {
-            // 复杂参数从临时区加载
-            emit("lw a" + std::to_string(i) + ", " + std::to_string(complexArgTempOffset[i]) + "(sp)");
-        }
+        emit("lw a" + std::to_string(i) + ", " +
+             std::to_string(tempBase + static_cast<int>(i) * 4) + "(sp)");
     }
 
-    // 3) 处理参数8+：简单参数直接存储，复杂参数从临时区搬运
+    // 3) Place remaining args into spill area at the beginning of the frame
+    //    Use t0 as scratch to avoid clobbering a0-a7 which already hold args 0..7
     for (size_t i = 8; i < argCount; i++)
     {
+        int src = tempBase + static_cast<int>(i) * 4;
         int dst = static_cast<int>(i - 8) * 4;
-        if (isSimpleArg[i]) 
-        {
-            // 简单参数直接加载到t0再存储
-            tryLoadSimpleExprTo(expr->arguments[i].get(), "t0");
-            emit("sw t0, " + std::to_string(dst) + "(sp)");
-        } 
-        else 
-        {
-            // 复杂参数从临时区搬运
-            emit("lw t0, " + std::to_string(complexArgTempOffset[i]) + "(sp)");
-            emit("sw t0, " + std::to_string(dst) + "(sp)");
-        }
+        emit("lw t0, " + std::to_string(src) + "(sp)");
+        emit("sw t0, " + std::to_string(dst) + "(sp)");
     }
 
     // 4) Make the call
